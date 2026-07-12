@@ -1,0 +1,88 @@
+# syntax=docker/dockerfile:1.7
+# ---------------------------------------------------------------------------
+# Panoptes GPU serving image.
+#
+# Base: CUDA 12.9 runtime + cuDNN on Ubuntu 24.04 (ships Python 3.12 via apt).
+# Build from the REPO ROOT so the whole source tree is in context:
+#
+#   docker build -f deploy/docker/Dockerfile.gpu -t panoptes:0.1.0-gpu .
+#
+# Run with the NVIDIA container toolkit (--gpus all). The image sets
+# NVIDIA_DRIVER_CAPABILITIES=compute,video,utility — "video" is required for
+# NVDEC hardware decode; do not trim it.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------- builder --
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04 AS builder
+
+# uv is a single static binary; copying it beats pip-bootstrapping.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3.12 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV UV_PYTHON=python3.12 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:$PATH"
+
+RUN uv venv /opt/venv
+
+WORKDIR /build
+# The dashboard ships inside the wheel (src/panoptes/dashboard) — no separate
+# COPY needed.
+COPY pyproject.toml README.md ./
+COPY src ./src
+
+# GPU serving extras. The "yolo" extra is deliberately NOT here (AGPL —
+# see the toggle at the bottom of this stage).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install ".[onnx,alpr,postgres,gpu-monitor]"
+
+# The "onnx" extra pins the CPU onnxruntime wheel (it is what the alpr stack
+# depends on too). Swap it for the CUDA build so detector + ALPR ONNX sessions
+# run on the GPU. onnxruntime-gpu 1.27.0 targets CUDA 12.x (CUDA 12 support is
+# deprecated upstream — revisit when moving to a CUDA 13 base image).
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip uninstall onnxruntime \
+    && uv pip install onnxruntime-gpu==1.27.0
+
+# --- AGPL toggle ------------------------------------------------------------
+# The ultralytics/YOLO26 backend is AGPL-3.0, INCLUDING its network clause:
+# offering this image as a hosted service triggers source-disclosure duties.
+# Uncomment ONLY if you hold an Ultralytics Enterprise License or you comply
+# with AGPL-3.0 for the whole deployment. deploy/scripts/license_gate.py will
+# flag the resulting image unless run with --allow-agpl.
+# RUN --mount=type=cache,target=/root/.cache/uv \
+#     uv pip install ".[yolo]"
+# ----------------------------------------------------------------------------
+
+# ---------------------------------------------------------------- runtime --
+FROM nvidia/cuda:12.9.2-cudnn-runtime-ubuntu24.04
+
+# libglib2.0: needed by opencv-python-headless; libgomp1: onnxruntime openmp;
+# curl: container HEALTHCHECK below.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.12 ca-certificates curl libglib2.0-0t64 libgomp1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --create-home --shell /usr/sbin/nologin panoptes \
+    && mkdir -p /app/data /etc/panoptes \
+    && chown -R panoptes:panoptes /app
+
+COPY --from=builder /opt/venv /opt/venv
+
+# "video" capability => NVDEC; keep all three even if you only do inference.
+ENV PATH="/opt/venv/bin:$PATH" \
+    NVIDIA_DRIVER_CAPABILITIES=compute,video,utility \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+USER panoptes
+EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/api/v1/system/health || exit 1
+
+# Mount your config at /etc/panoptes (see deploy/docker-compose.yml).
+ENTRYPOINT ["panoptes", "serve", "-c", "/etc/panoptes/panoptes.yaml"]

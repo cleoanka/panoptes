@@ -1,0 +1,18 @@
+# ClusterIP Service in front of the single Panoptes replica.
+# Expose externally via your Ingress controller / Gateway API route and
+# terminate TLS there; the API authenticates with the X-API-Key header.
+apiVersion: v1
+kind: Service
+metadata:
+  name: panoptes
+  labels:
+    app.kubernetes.io/name: panoptes
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: panoptes
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

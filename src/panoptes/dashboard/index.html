@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>Panoptes — Operations Console</title>
+<!-- data: favicon suppresses the /favicon.ico request on servers with no icon route -->
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <svg class="brand-mark" viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+      <circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.6"/>
+      <circle cx="12" cy="12" r="3" fill="currentColor"/>
+      <path d="M12 1.6v4M12 18.4v4M1.6 12h4M18.4 12h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+    </svg>
+    <span class="brand-name">PANOPTES</span>
+    <span class="brand-sub">road &amp; vehicle intelligence</span>
+  </div>
+  <div class="topbar-right">
+    <span class="conn" title="REST API reachability"><span id="dot-api" class="dot"></span><span class="conn-label">API</span></span>
+    <span class="conn" title="Live event WebSocket"><span id="dot-feed" class="dot"></span><span class="conn-label">FEED</span></span>
+    <span id="clock" class="num clock" title="Local time">--:--:--</span>
+    <label class="key-field" for="api-key">
+      <span class="key-label">API KEY</span>
+      <input id="api-key" type="password" placeholder="none — open mode" autocomplete="off" spellcheck="false">
+    </label>
+    <button id="key-vis" class="btn btn-toggle" type="button" aria-pressed="false">
+      <span class="tick" aria-hidden="true"><svg viewBox="0 0 12 12" width="10" height="10"><path d="M2.5 6.5 5 9l4.5-5.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+      <span>SHOW</span>
+    </button>
+  </div>
+</header>
+
+<div id="banners" aria-live="polite"></div>
+
+<main>
+  <section id="streams-panel" class="panel" aria-label="Streams">
+    <div class="panel-head">
+      <h2>Streams</h2>
+      <span class="panel-tools"><span id="streams-count" class="num panel-count">0</span></span>
+    </div>
+    <div id="streams-empty" class="empty">no streams reported yet</div>
+    <div id="stream-list"></div>
+  </section>
+
+  <section id="events-panel" class="panel" aria-label="Live events">
+    <div class="panel-head">
+      <h2>Live events</h2>
+      <span class="panel-tools"><span id="feed-total" class="num panel-count">0</span></span>
+    </div>
+    <div class="chip-bar">
+      <div class="chip-actions">
+        <span class="chip-actions-label">TYPES</span>
+        <button id="chips-all" class="btn btn-mini" type="button">ALL</button>
+        <button id="chips-none" class="btn btn-mini" type="button">NONE</button>
+      </div>
+      <div id="chips" role="group" aria-label="Event type filters"></div>
+    </div>
+    <div id="feed-empty" class="empty">waiting for events&hellip;</div>
+    <div id="feed"></div>
+  </section>
+
+  <section id="plates-panel" class="panel" aria-label="Plate search">
+    <div class="panel-head">
+      <h2>Plates</h2>
+      <span class="panel-tools"><span id="plates-count" class="num panel-count">&mdash;</span></span>
+    </div>
+    <form id="plate-form">
+      <input id="plate-q" type="search" placeholder="plate text — partial match" autocomplete="off" spellcheck="false" aria-label="Plate query">
+      <button class="btn btn-accent" type="submit">SEARCH</button>
+    </form>
+    <div id="plates-status" class="empty">enter a query to search recorded plate reads</div>
+    <div class="table-wrap">
+      <table id="plates-table" hidden>
+        <thead>
+          <tr>
+            <th>Plate</th><th>Stream</th><th class="ta-r">Track</th>
+            <th class="ta-r">Conf</th><th>Valid</th><th>Country</th><th>Time</th>
+          </tr>
+        </thead>
+        <tbody id="plates-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="system-panel" class="panel" aria-label="System">
+    <div class="panel-head">
+      <h2>System</h2>
+      <span class="panel-tools">
+        <a class="btn btn-mini" href="/metrics" target="_blank" rel="noopener">/METRICS</a>
+        <button id="system-refresh" class="btn btn-mini" type="button">REFRESH</button>
+      </span>
+    </div>
+    <div id="system-body"><div class="empty">loading&hellip;</div></div>
+  </section>
+</main>
+
+<footer>PANOPTES operations console &mdash; single-node road &amp; vehicle intelligence</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

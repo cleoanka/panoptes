@@ -1,0 +1,86 @@
+# ---------------------------------------------------------------------------
+# Panoptes evaluation stack: API + Postgres + Prometheus + Grafana (CPU image).
+#
+# Run from the REPO ROOT so relative paths resolve correctly:
+#
+#   docker compose --project-directory . -f deploy/docker-compose.yml up -d --build
+#
+# (or just `make compose-up`). GPU deployments layer the override on top:
+#
+#   docker compose --project-directory . \
+#     -f deploy/docker-compose.yml -f deploy/docker-compose.gpu.yml up -d --build
+#
+# Put your panoptes.yaml into ./config/ — it is mounted at /etc/panoptes.
+# `make compose-up` seeds it from deploy/config/panoptes.compose.yaml on
+# first run (mock detector as a zero-asset wiring check — edit it for real
+# cameras/backends). Do NOT set database.url in that file; the container env
+# below supplies the Postgres DSN (env must not be shadowed by an explicit
+# YAML value).
+# ---------------------------------------------------------------------------
+
+name: panoptes
+
+services:
+  panoptes:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.cpu
+    image: panoptes:0.1.0-cpu
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config:/etc/panoptes:ro
+      - panoptes-data:/app/data
+    environment:
+      # Override-able secrets come from the shell / an .env file next to the
+      # project root — never hardcode real credentials here.
+      PANOPTES_DATABASE__URL: postgresql+asyncpg://panoptes:${POSTGRES_PASSWORD:-panoptes}@postgres:5432/panoptes
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: panoptes
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-panoptes}  # change for anything non-local
+      POSTGRES_DB: panoptes
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U panoptes -d panoptes"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  prometheus:
+    image: prom/prometheus:v3.13.0
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+
+  grafana:
+    image: grafana/grafana:12.3.0
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}  # set a real one outside localhost
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+
+volumes:
+  panoptes-data:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

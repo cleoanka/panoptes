@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Base dependencies only: the suite runs on the mock detector and never
+# downloads model weights.
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (base + dev)
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check src tests
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install (base + dev)
+        run: python -m pip install -e ".[dev]"
+      - name: Pytest
+        run: python -m pytest -q
+
+  license-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install (base deps define the sellable image)
+        run: python -m pip install -e . pip-licenses
+      # Full gate: metadata + banned packages + the x264/x265 binary scan
+      # (the PyAV wheel trap). opencv-python-headless is exempted from the
+      # BINARY scan only — its wheel bundles FFmpeg, and the redistributed
+      # Linux image ships LGPL-configured/system OpenCV instead (documented
+      # in docs/LICENSING.md). Metadata + banned-package checks stay fully
+      # enforced, including AGPL (ultralytics is never installed here).
+      - name: License gate (full scan, opencv binary-exempt)
+        run: python deploy/scripts/license_gate.py --exempt-package opencv-python-headless

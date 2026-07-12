@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------------------
+# Panoptes example configuration — a two-camera highway deployment.
+# Every field here is optional unless marked; unset fields use sane defaults.
+# Environment overrides: PANOPTES_SERVER__PORT=9000, PANOPTES_DETECTOR__DEVICE=cuda:0 ...
+# ---------------------------------------------------------------------------
+
+detector:
+  backend: ultralytics        # ultralytics | rfdetr | onnx | tensorrt | mock
+  model: yolo26s.pt           # auto-downloads on first run (COCO-pretrained)
+  device: auto                # auto | cpu | cuda:0 | mps
+  imgsz: 640
+  conf: 0.25
+  half: true
+  max_batch: 8
+
+tracker:
+  activation_score: 0.5
+  min_hits: 3
+  lost_ttl: 1.0               # seconds a lost vehicle may be re-acquired
+
+alpr:
+  enabled: true
+  country: TR                 # plate-format validation + OCR correction
+  every_n_frames: 3
+  vote_min_reads: 2
+
+attributes:
+  color:
+    enabled: true
+    method: heuristic         # heuristic works out of the box; 'model' after training
+  makemodel:
+    enabled: false            # enable after training (see training/EGITIM.md)
+
+watchlists:
+  - id: stolen
+    name: Çalıntı araç listesi
+    plates: ["34ABC123", "06XYZ42"]
+
+streams:
+  - id: cam-north
+    name: Kuzey gişe kamerası
+    source: rtsp://user:pass@10.0.0.11:554/stream1
+    resize_width: 1280
+    calibration:              # 4+ image->ground correspondences (metres)
+      image_points:  [[412, 512], [988, 500], [1160, 820], [212, 843]]
+      ground_points: [[0, 0],     [7.2, 0],   [7.2, 22.0], [0, 22.0]]
+    speed:
+      limit_kmh: 90
+    governor:                 # adaptive sampling: idle scenes cost ~nothing
+      idle_fps: 2
+      active_fps: 15
+    lines:
+      - id: gate
+        name: Gişe hattı
+        points: [[220, 700], [1150, 690]]
+    zones:
+      - id: shoulder
+        name: Emniyet şeridi
+        points: [[40, 620], [200, 600], [230, 860], [30, 870]]
+        dwell_alert_s: 20
+
+  - id: demo-file
+    name: Demo (video dosyası)
+    source: ./examples/traffic.mp4
+    enabled: false
+    loop_file: true
+
+rules:
+  - id: speeding-alert
+    name: Hız ihlali webhook'u
+    when: { type: speed, min_kmh: 90 }
+    actions:
+      - { type: snapshot, annotate: true }
+      - { type: webhook, url: "https://ops.example.com/hooks/speeding" }
+    cooldown_s: 30
+
+  - id: truck-on-shoulder
+    name: Emniyet şeridinde ağır vasıta
+    when:
+      type: all_of
+      conditions:
+        - { type: zone_dwell, zone: shoulder, min_seconds: 20 }
+        - { type: class_is, classes: [truck, bus] }
+    actions:
+      - { type: snapshot }
+      - { type: log, level: warning }
+    streams: [cam-north]
+
+  - id: stolen-vehicle
+    name: Çalıntı araç yakalama
+    when: { type: plate_watchlist, watchlist: stolen }
+    actions:
+      - { type: snapshot }
+      - { type: webhook, url: "https://ops.example.com/hooks/stolen" }
+    cooldown_s: 5
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  api_keys: []                # EMPTY = auth disabled; set keys in production!
+  media_dir: ./data/media
+
+database:
+  url: sqlite+aiosqlite:///./data/panoptes.db   # use postgres+asyncpg://... in prod
+  retention_days: 30
+
+observability:
+  metrics: true               # Prometheus at /metrics
+  log_level: INFO

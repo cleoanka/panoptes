@@ -1,0 +1,167 @@
+# ---------------------------------------------------------------------------
+# Panoptes weights provenance manifest.
+#
+# Every model artifact that can end up inside a shipped image or customer
+# deliverable is declared here with its SPDX license and a ship_ok verdict:
+#
+#   ship_ok: true    redistributable in commercial builds as-is
+#   ship_ok: false   NOT redistributable (license blocks it) — see notes
+#   ship_ok: review  package license is clean but weight provenance carries
+#                    risk; legal review before bundling in a paid deliverable
+#
+# CI cross-checks this file against the built image; docs/LICENSING.md holds
+# the long-form rationale. Facts verified 2026-07-12.
+# ---------------------------------------------------------------------------
+
+manifest_version: 1
+updated: "2026-07-12"
+
+weights:
+  # ------------------------------------------------------------- YOLO26 ----
+  # AGPL-3.0 applies to the ultralytics package AND its released weights,
+  # including fine-tunes. ship_ok flips to true only under an Ultralytics
+  # Enterprise License (record the contract id in `notes` when purchased).
+  - id: yolo26n
+    family: yolo26
+    task: vehicle-detection
+    file: yolo26n.pt
+    source: https://github.com/ultralytics/assets/releases/tag/v8.4.0
+    spdx: AGPL-3.0-only
+    ship_ok: false
+    provenance: Ultralytics official release, trained on COCO (mAP 40.9).
+    notes: Optional [yolo] extra only; network clause applies to hosted use.
+  - id: yolo26s
+    family: yolo26
+    task: vehicle-detection
+    file: yolo26s.pt
+    source: https://github.com/ultralytics/assets/releases/tag/v8.4.0
+    spdx: AGPL-3.0-only
+    ship_ok: false
+    provenance: Ultralytics official release, trained on COCO (mAP 48.6).
+    notes: Optional [yolo] extra only; network clause applies to hosted use.
+  - id: yolo26m
+    family: yolo26
+    task: vehicle-detection
+    file: yolo26m.pt
+    source: https://github.com/ultralytics/assets/releases/tag/v8.4.0
+    spdx: AGPL-3.0-only
+    ship_ok: false
+    provenance: Ultralytics official release, trained on COCO (mAP 53.1).
+    notes: Optional [yolo] extra only; network clause applies to hosted use.
+  - id: yolo26l
+    family: yolo26
+    task: vehicle-detection
+    file: yolo26l.pt
+    source: https://github.com/ultralytics/assets/releases/tag/v8.4.0
+    spdx: AGPL-3.0-only
+    ship_ok: false
+    provenance: Ultralytics official release, trained on COCO (mAP 55.0).
+    notes: Optional [yolo] extra only; network clause applies to hosted use.
+  - id: yolo26x
+    family: yolo26
+    task: vehicle-detection
+    file: yolo26x.pt
+    source: https://github.com/ultralytics/assets/releases/tag/v8.4.0
+    spdx: AGPL-3.0-only
+    ship_ok: false
+    provenance: Ultralytics official release, trained on COCO (mAP 57.5).
+    notes: Optional [yolo] extra only; network clause applies to hosted use.
+
+  # ------------------------------------------------------------ RF-DETR ----
+  # Apache-2.0 code AND weights for the Nano..Large tier — the license-clean
+  # default detector for sellable builds.
+  - id: rf-detr-nano
+    family: rf-detr
+    task: vehicle-detection
+    source: https://github.com/roboflow/rf-detr
+    spdx: Apache-2.0
+    ship_ok: true
+    provenance: >-
+      Roboflow release; pretraining includes Objects365-derived pseudo-labels
+      (documented by upstream). COCO AP 48.4.
+    notes: Expects RGB input; Panoptes detect backend converts from BGR.
+  - id: rf-detr-small
+    family: rf-detr
+    task: vehicle-detection
+    source: https://github.com/roboflow/rf-detr
+    spdx: Apache-2.0
+    ship_ok: true
+    provenance: >-
+      Roboflow release; pretraining includes Objects365-derived pseudo-labels
+      (documented by upstream).
+    notes: Expects RGB input; Panoptes detect backend converts from BGR.
+  - id: rf-detr-medium
+    family: rf-detr
+    task: vehicle-detection
+    source: https://github.com/roboflow/rf-detr
+    spdx: Apache-2.0
+    ship_ok: true
+    provenance: >-
+      Roboflow release; pretraining includes Objects365-derived pseudo-labels
+      (documented by upstream).
+    notes: Expects RGB input; Panoptes detect backend converts from BGR.
+  - id: rf-detr-large
+    family: rf-detr
+    task: vehicle-detection
+    source: https://github.com/roboflow/rf-detr
+    spdx: Apache-2.0
+    ship_ok: true
+    provenance: >-
+      Roboflow release; pretraining includes Objects365-derived pseudo-labels
+      (documented by upstream). COCO AP 56.5.
+    notes: Expects RGB input; Panoptes detect backend converts from BGR.
+  # XL/2XL tiers are Platform Model License 1.0 — NOT redistributable.
+  - id: rf-detr-xl
+    family: rf-detr
+    task: vehicle-detection
+    source: https://github.com/roboflow/rf-detr
+    spdx: LicenseRef-PML-1.0
+    ship_ok: false
+    provenance: Roboflow release under the Platform Model License.
+    notes: Do not download, bundle, or fine-tune for commercial builds.
+  - id: rf-detr-2xl
+    family: rf-detr
+    task: vehicle-detection
+    source: https://github.com/roboflow/rf-detr
+    spdx: LicenseRef-PML-1.0
+    ship_ok: false
+    provenance: Roboflow release under the Platform Model License.
+    notes: Do not download, bundle, or fine-tune for commercial builds.
+
+  # --------------------------------------------------------------- ALPR ----
+  - id: fast-plate-ocr-cct-s-v2-global
+    family: fast-plate-ocr
+    task: plate-ocr
+    file: cct-s-v2-global-model
+    source: https://github.com/ankandrew/fast-plate-ocr
+    spdx: MIT
+    ship_ok: true
+    provenance: >-
+      fast-plate-ocr 1.1.0 official model, 65-country region head; validated
+      on Turkish plates (97.8% plate / 99.63% char accuracy).
+    notes: Default OCR model of the [alpr] extra.
+  - id: open-image-models-yolo-v9-s-608-license-plate-end2end
+    family: open-image-models
+    task: plate-detection
+    file: yolo-v9-s-608-license-plate-end2end
+    source: https://github.com/ankandrew/open-image-models
+    spdx: MIT
+    ship_ok: review
+    provenance_risk: >-
+      Package and weight files are published under MIT, but the architecture
+      lineage is YOLOv9 whose upstream training code is GPL-3.0 — weight
+      provenance is not fully clean-room. Legal review before bundling in a
+      paid deliverable; a custom plate-detector hook is provided as fallback.
+    notes: Default plate detector of the [alpr] extra (yolo-v9-t/s variants alike).
+
+  # ---------------------------------------------------- Apache fallback ----
+  - id: dfine-l-coco
+    family: d-fine
+    task: vehicle-detection
+    source: https://huggingface.co/ustc-community/dfine_l_coco
+    spdx: Apache-2.0
+    ship_ok: true
+    provenance: >-
+      D-FINE COCO checkpoint served via transformers (DFineForObjectDetection).
+      Fully Apache alternative when RF-DETR does not fit.
+    notes: Do NOT use the obj2coco variants — Objects365 terms are academic-only.

@@ -1,0 +1,116 @@
+# ---------------------------------------------------------------------------
+# Panoptes single-replica GPU Deployment.
+#
+# Panoptes is a single-node, stateful multi-stream engine: per-stream tracker
+# state lives in process memory, so run ONE replica per camera set and scale
+# by sharding streams across deployments — not by adding replicas behind one
+# Service.
+#
+# Prerequisites:
+#   * NVIDIA GPU Operator or device plugin (exposes nvidia.com/gpu).
+#   * `kubectl apply -f configmap-example.yaml` (edit it first).
+#   * Push your own image; the tag below is a placeholder for your registry.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: panoptes
+  labels:
+    app.kubernetes.io/name: panoptes
+    app.kubernetes.io/component: engine
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # one GPU + stateful stream workers: never run two at once
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: panoptes
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: panoptes
+        app.kubernetes.io/component: engine
+    spec:
+      # Uncomment when the cluster registers the NVIDIA runtime as a
+      # RuntimeClass (GPU Operator default name: "nvidia"). Clusters where
+      # nvidia is the node-wide default runtime don't need it.
+      # runtimeClassName: nvidia
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      containers:
+        - name: panoptes
+          image: ghcr.io/cleoanka/panoptes:0.1.0-gpu
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # "video" => NVDEC hardware decode; keep all three capabilities.
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: compute,video,utility
+            # Secrets stay OUT of the image and the ConfigMap. Example:
+            # - name: PANOPTES_DATABASE__URL
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: panoptes-secrets
+            #       key: database-url
+            # - name: PANOPTES_SERVER__API_KEYS
+            #   valueFrom:
+            #     secretKeyRef:
+            #       name: panoptes-secrets
+            #       key: api-keys # JSON list, e.g. ["change-me"]
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+              nvidia.com/gpu: 1
+          livenessProbe:
+            httpGet:
+              path: /api/v1/system/health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /api/v1/system/health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/panoptes
+              readOnly: true
+            - name: data
+              mountPath: /app/data
+      volumes:
+        - name: config
+          configMap:
+            name: panoptes-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: panoptes-data
+---
+# Snapshot/media/SQLite storage. Size for snapshot_retention_days worth of
+# JPEG evidence; 20Gi is a conservative single-site starting point.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: panoptes-data
+  labels:
+    app.kubernetes.io/name: panoptes
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi

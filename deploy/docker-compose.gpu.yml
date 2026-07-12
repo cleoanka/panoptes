@@ -1,0 +1,25 @@
+# ---------------------------------------------------------------------------
+# GPU override — layer on top of the base file (order matters):
+#
+#   docker compose --project-directory . \
+#     -f deploy/docker-compose.yml -f deploy/docker-compose.gpu.yml up -d --build
+#
+# Requires the NVIDIA Container Toolkit on the host. The "video" driver
+# capability is mandatory for NVDEC hardware decode — do not trim it.
+# ---------------------------------------------------------------------------
+
+services:
+  panoptes:
+    build:
+      context: .
+      dockerfile: deploy/docker/Dockerfile.gpu
+    image: panoptes:0.1.0-gpu
+    environment:
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

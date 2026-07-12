@@ -1,0 +1,50 @@
+Panoptes — road & vehicle intelligence platform
+Copyright 2026 cleoanka
+
+This product includes software developed as part of the Panoptes project
+(https://github.com/cleoanka/panoptes), licensed under the Apache License,
+Version 2.0.
+
+--------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------
+
+Panoptes builds on the following open-source software. Base dependencies
+(installed with every build):
+
+  * NumPy (BSD-3-Clause), opencv-python-headless (Apache-2.0 Python
+    bindings; the prebuilt wheels bundle FFmpeg (LGPL) and, on some
+    platforms, GPL-licensed x264/x265 object code — see docs/LICENSING.md),
+    Pydantic + pydantic-settings (MIT), PyYAML (MIT), FastAPI (MIT),
+    Starlette (BSD-3-Clause), Uvicorn (BSD-3-Clause), python-multipart
+    (Apache-2.0), SQLAlchemy (MIT), aiosqlite (MIT), Alembic (MIT),
+    httpx (BSD-3-Clause), Typer (MIT), structlog (Apache-2.0/MIT),
+    prometheus-client (Apache-2.0).
+  * uvicorn[standard] runtime companions: uvloop (MIT/Apache-2.0),
+    httptools (MIT), websockets (BSD-3-Clause), watchfiles (MIT),
+    python-dotenv (BSD-3-Clause).
+
+Optional extras (installed only when explicitly selected):
+
+  * ultralytics / YOLO26 ("yolo" extra) — AGPL-3.0, including model
+    weights. Not included in default builds; commercial redistribution
+    requires an Ultralytics Enterprise License or full AGPL compliance.
+  * rfdetr ("rfdetr" extra) — Apache-2.0 code; Nano/Small/Medium/Large
+    weights are Apache-2.0 (XL/2XL tiers are under a different license
+    and are not used by Panoptes).
+  * onnxruntime ("onnx" extra) — MIT.
+  * fast-plate-ocr and open-image-models ("alpr" extra) — MIT. See
+    docs/LICENSING.md for the provenance note on the bundled
+    plate-detector weights.
+  * PyAV ("av" extra) — BSD-3-Clause bindings; prebuilt wheels bundle
+    FFmpeg with GPL-licensed x264/x265. See docs/LICENSING.md before
+    redistributing container images that include this extra.
+  * asyncpg ("postgres" extra) — Apache-2.0.
+  * nvidia-ml-py ("gpu-monitor" extra) — BSD-3-Clause.
+
+The ByteTrack-style tracker in panoptes.track is a clean-room
+implementation of the published algorithm; it contains no code from the
+original ByteTrack repository or from any AGPL-licensed tracker package.
+
+Full licensing analysis, including model-weight provenance and the CI
+license gate, is documented in docs/LICENSING.md.

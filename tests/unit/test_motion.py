@@ -1,0 +1,259 @@
+"""Golden tests for the motion estimator.
+
+Geometry: a 100 px image square maps onto a 10 m ground square, i.e.
+1 px == 0.1 m with axes aligned. A vehicle advancing 20 px per 0.1 s
+therefore moves 2 ground-metres per 0.1 s == 20 m/s == 72 km/h.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from panoptes.core.config import CalibrationConfig, SpeedConfig
+from panoptes.core.errors import CalibrationError
+from panoptes.core.events import EventType
+from panoptes.core.geometry import BBox
+from panoptes.core.types import Track, TrackPoint, TrackState, VehicleClass
+from panoptes.motion import MotionEstimator, reprojection_error
+
+WALL_T0 = 1_760_000_000.0  # arbitrary UNIX base; must never affect physics
+
+
+def square_calibration() -> CalibrationConfig:
+    return CalibrationConfig(
+        image_points=[(0, 0), (100, 0), (100, 100), (0, 100)],
+        ground_points=[(0, 0), (10, 0), (10, 10), (0, 10)],
+    )
+
+
+def make_track(track_id: int = 1) -> Track:
+    return Track(
+        track_id=track_id,
+        stream_id="cam1",
+        vehicle_class=VehicleClass.CAR,
+        class_confidence=0.9,
+        state=TrackState.ACTIVE,
+    )
+
+
+def advance(track: Track, timestamp: float, cx: float, cy: float) -> None:
+    """Append an observation whose bbox.bottom_center is (cx, cy)."""
+    bbox = BBox(cx - 20.0, cy - 30.0, cx + 20.0, cy)
+    frame_index = len(track.points)
+    track.points.append(TrackPoint(timestamp=timestamp, frame_index=frame_index, bbox=bbox))
+    if len(track.points) == 1:
+        track.first_timestamp = timestamp
+        track.first_frame = frame_index
+    track.last_timestamp = timestamp
+    track.last_frame = frame_index
+    track.hits += 1
+
+
+def run_constant_velocity(
+    estimator: MotionEstimator,
+    track: Track,
+    *,
+    seconds: float,
+    fps: float = 10.0,
+    px_per_step: tuple[float, float] = (20.0, 0.0),
+    start: tuple[float, float] = (0.0, 50.0),
+):
+    """Drive the worker loop: one appended point + one process() per frame."""
+    events = []
+    for i in range(round(seconds * fps) + 1):
+        t = i / fps
+        advance(track, t, start[0] + px_per_step[0] * i, start[1] + px_per_step[1] * i)
+        events.extend(estimator.process([track], "cam1", WALL_T0 + t))
+    return events
+
+
+# ----------------------------------------------------------------------
+# golden: speed accuracy
+# ----------------------------------------------------------------------
+def test_golden_speed_72kmh_within_2pct() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    run_constant_velocity(estimator, track, seconds=3.0)
+    assert track.speed_kmh == pytest.approx(72.0, rel=0.02)
+    assert track.data["max_speed_kmh"] == pytest.approx(72.0, rel=0.02)
+
+
+def test_distance_accumulates_ground_metres() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    # 30 steps of 2 m each (31 points, first has no predecessor).
+    run_constant_velocity(estimator, track, seconds=3.0)
+    assert track.distance_m == pytest.approx(60.0, rel=0.01)
+
+
+def test_ema_warmup_first_estimate_is_raw() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    for i in range(8):  # t = 0.0 .. 0.7
+        t = i / 10.0
+        advance(track, t, 20.0 * i, 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+        if t < 0.7:
+            assert track.speed_kmh is None  # min_track_s gate
+    # First reported value must be the raw 72, not 72 blended toward 0.
+    assert track.speed_kmh == pytest.approx(72.0, rel=1e-6)
+
+
+def test_windowed_estimate_rejects_pixel_jitter() -> None:
+    # +-1 px alternating jitter at 30 fps would swing a frame-to-frame
+    # estimate by tens of km/h; the 1 s window must hold within 3%.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    fps = 30.0
+    for i in range(int(2 * fps) + 1):
+        t = i / fps
+        jitter = 1.0 if i % 2 == 0 else -1.0
+        advance(track, t, 200.0 * t + jitter, 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+    assert track.speed_kmh == pytest.approx(72.0, rel=0.03)
+
+
+def test_no_speed_across_reacquisition_gap() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    for i in range(4):  # t = 0.0 .. 0.3, too young for speed
+        advance(track, i / 10.0, 20.0 * i, 50.0)
+        estimator.process([track], "cam1", WALL_T0)
+    advance(track, 6.0, 900.0, 50.0)  # re-acquired far away after 5.7 s
+    estimator.process([track], "cam1", WALL_T0 + 6.0)
+    # Only one grounded point inside the window -> no estimate.
+    assert track.speed_kmh is None
+
+
+# ----------------------------------------------------------------------
+# golden: SPEEDING events
+# ----------------------------------------------------------------------
+def test_speeding_fires_exactly_once_in_10s() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(limit_kmh=60.0))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=10.0)
+    speeding = [e for e in events if e.type is EventType.SPEEDING]
+    assert len(speeding) == 1
+    event = speeding[0]
+    assert event.stream_id == "cam1"
+    assert event.track_id == 1
+    assert event.vehicle_class == "car"
+    assert event.data["limit_kmh"] == 60.0
+    assert event.data["speed_kmh"] == pytest.approx(72.0, abs=1.5)
+    assert event.wall_ts == pytest.approx(WALL_T0 + event.timestamp)
+    assert track.data["speeding_emitted_ts"] == pytest.approx(event.timestamp)
+
+
+def test_speeding_reemits_after_30s() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(limit_kmh=60.0))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=35.0)
+    speeding = [e for e in events if e.type is EventType.SPEEDING]
+    assert len(speeding) == 2
+    assert speeding[1].timestamp - speeding[0].timestamp >= 30.0
+
+
+def test_speed_disabled_suppresses_events() -> None:
+    estimator = MotionEstimator(
+        square_calibration(), SpeedConfig(enabled=False, limit_kmh=60.0)
+    )
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=3.0)
+    assert events == []
+
+
+def test_under_limit_no_events() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(limit_kmh=90.0))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=3.0)
+    assert events == []
+
+
+# ----------------------------------------------------------------------
+# no calibration: total no-op
+# ----------------------------------------------------------------------
+def test_no_calibration_no_events_fields_stay_none() -> None:
+    estimator = MotionEstimator(None, SpeedConfig(limit_kmh=60.0))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=2.0)
+    assert events == []
+    assert track.speed_kmh is None
+    assert track.direction_deg is None
+    assert track.distance_m == 0.0
+    assert all(p.ground is None for p in track.points)
+
+
+# ----------------------------------------------------------------------
+# heading
+# ----------------------------------------------------------------------
+def test_direction_90_for_plus_y_motion() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    run_constant_velocity(
+        estimator, track, seconds=2.0, px_per_step=(0.0, 20.0), start=(50.0, 40.0)
+    )
+    assert track.direction_deg == pytest.approx(90.0, abs=0.5)
+
+
+def test_direction_270_for_minus_y_motion() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    run_constant_velocity(
+        estimator, track, seconds=2.0, px_per_step=(0.0, -20.0), start=(50.0, 500.0)
+    )
+    assert track.direction_deg == pytest.approx(270.0, abs=0.5)
+
+
+def test_direction_0_for_plus_x_motion() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    run_constant_velocity(estimator, track, seconds=2.0)
+    assert track.direction_deg is not None
+    assert min(track.direction_deg, 360.0 - track.direction_deg) < 0.5
+
+
+# ----------------------------------------------------------------------
+# ground back-fill
+# ----------------------------------------------------------------------
+def test_backfills_ground_on_preexisting_points() -> None:
+    # The tracker confirms a track after min_hits frames, so the first
+    # process() call sees several ungrounded points at once.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    for i in range(3):
+        advance(track, i / 10.0, 20.0 * i, 50.0)
+    estimator.process([track], "cam1", WALL_T0)
+    assert all(p.ground is not None for p in track.points)
+    assert track.points[0].ground == pytest.approx((0.0, 5.0))
+    assert track.points[2].ground == pytest.approx((4.0, 5.0))
+    assert track.distance_m == pytest.approx(4.0)
+
+
+def test_empty_tracks_and_empty_history_are_safe() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(limit_kmh=60.0))
+    assert estimator.process([], "cam1", WALL_T0) == []
+    assert estimator.process([make_track()], "cam1", WALL_T0) == []
+
+
+# ----------------------------------------------------------------------
+# reprojection error helper
+# ----------------------------------------------------------------------
+def test_reprojection_error_near_zero_for_exact_square() -> None:
+    assert reprojection_error(square_calibration()) < 1e-6
+
+
+def test_reprojection_error_exposes_noisy_correspondence() -> None:
+    calibration = CalibrationConfig(
+        image_points=[(0, 0), (100, 0), (100, 100), (0, 100), (53, 50)],
+        ground_points=[(0, 0), (10, 0), (10, 10), (0, 10), (5, 5)],
+    )
+    assert reprojection_error(calibration) > 0.1
+
+
+def test_degenerate_calibration_raises_calibration_error() -> None:
+    collinear = CalibrationConfig(
+        image_points=[(0, 0), (10, 0), (20, 0), (30, 0)],
+        ground_points=[(0, 0), (1, 0), (2, 0), (3, 0)],
+    )
+    with pytest.raises(CalibrationError):
+        MotionEstimator(collinear, SpeedConfig())

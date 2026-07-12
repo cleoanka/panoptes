@@ -1,0 +1,15 @@
+# ---------------------------------------------------------------------------
+# Single-class license-plate detector dataset config (ultralytics data yaml).
+#
+# Used by training/train_plate_detector.py. Roboflow "yolov11" exports of the
+# plate datasets listed in EGITIM.md section 4.1 drop straight into this
+# layout (images/ + labels/ per split).
+# ---------------------------------------------------------------------------
+
+path: /data/datasets/plates
+train: images/train
+val: images/val
+test: images/test        # optional
+
+names:
+  0: license_plate

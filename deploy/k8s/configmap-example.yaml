@@ -1,0 +1,62 @@
+# Example Panoptes config as a ConfigMap — EDIT before applying.
+# Mounted at /etc/panoptes by deployment.yaml (the engine reads
+# /etc/panoptes/panoptes.yaml).
+#
+# Keep secrets (database DSN, API keys, webhook auth headers) OUT of this
+# ConfigMap — inject them as env vars from a Secret (see deployment.yaml);
+# PANOPTES_* env vars override YAML fields, so omit those fields here.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: panoptes-config
+  labels:
+    app.kubernetes.io/name: panoptes
+data:
+  panoptes.yaml: |
+    detector:
+      backend: onnx                # license-clean default for the GPU image
+      model: /app/data/models/detector.onnx
+      device: cuda:0
+      imgsz: 640
+      conf: 0.25
+      max_batch: 8
+
+    alpr:
+      enabled: true
+      country: TR
+      every_n_frames: 3
+
+    streams:
+      - id: cam-01
+        name: Intersection north
+        source: rtsp://camera-user:camera-pass@10.0.0.11:554/stream1
+        resize_width: 1280
+        governor:
+          idle_fps: 2
+          active_fps: 15
+        lines:
+          - id: main-gate
+            points: [[220, 700], [1150, 690]]
+
+    server:
+      host: 0.0.0.0
+      port: 8080
+      media_dir: /app/data/media
+      upload_dir: /app/data/uploads
+      # api_keys: set via PANOPTES_SERVER__API_KEYS from a Secret instead.
+
+    database:
+      # SQLite on the PVC works for a single site. For Postgres, DELETE the
+      # url line below and inject PANOPTES_DATABASE__URL from a Secret
+      # (values set in YAML take precedence over env overrides).
+      url: sqlite+aiosqlite:////app/data/panoptes.db
+      retention_days: 30
+
+    privacy:
+      plate_storage: plain         # switch to "hashed" + hash_salt Secret for GDPR/KVKK
+      snapshot_retention_days: 30
+
+    observability:
+      metrics: true
+      log_level: INFO
+      log_json: true

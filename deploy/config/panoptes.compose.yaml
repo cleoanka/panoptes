@@ -1,0 +1,40 @@
+# ---------------------------------------------------------------------------
+# Container-ready starter config for the Compose stack.
+#
+# `make compose-up` / `make compose-gpu` copy this file to ./config/panoptes.yaml
+# on first run (it is then yours to edit — the seed never overwrites it).
+#
+# Two deliberate choices:
+#
+# 1. detector.backend is `mock`: it emits deterministic synthetic detections
+#    with zero model assets, so the very first `make compose-up` proves the
+#    whole stack wiring (API, Postgres, Prometheus, Grafana) is healthy.
+#    For real inference switch to a backend the images actually contain:
+#      - onnx     (both images; point `model` at your exported .onnx file,
+#                  e.g. /app/data/models/detector.onnx on the data volume)
+#      - rfdetr / tensorrt (install the extra / build the engine first)
+#      - ultralytics (AGPL-3.0 — requires uncommenting the toggle in the
+#                  Dockerfile and accepting the license terms; see
+#                  docs/LICENSING.md)
+#
+# 2. There is NO `database` block: compose injects the Postgres DSN via
+#    PANOPTES_DATABASE__URL, and a `database.url` set here would silently
+#    shadow it (explicit YAML values take precedence over env overrides).
+# ---------------------------------------------------------------------------
+
+detector:
+  backend: mock               # wiring-check default — see header for real backends
+  device: auto                # auto | cpu | cuda:0 (mock ignores this)
+
+# No streams yet: add your cameras here (see examples/panoptes.yaml for a
+# fully annotated two-camera setup with calibration, lines, zones and rules).
+streams: []
+
+server:
+  host: 0.0.0.0
+  port: 8080
+  api_keys: []                # EMPTY = auth disabled; set keys in production!
+
+observability:
+  metrics: true               # Prometheus scrapes /metrics every 5 s
+  log_level: INFO

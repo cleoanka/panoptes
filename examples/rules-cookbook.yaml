@@ -1,0 +1,138 @@
+# ---------------------------------------------------------------------------
+# Panoptes rules cookbook — the eight recipes from docs/RULES.md as a
+# loadable config fragment.
+#
+# Validate as-is:      panoptes validate-config -c examples/rules-cookbook.yaml
+# Use in a deployment: copy the rules (and watchlists) you need into your
+# panoptes.yaml, then attach the referenced geometry to YOUR streams. A rule
+# without a `streams:` key applies to every stream that has the referenced
+# line/zone ids — so the only wiring needed is matching geometry ids.
+#
+# The disabled stream below exists solely to show where each referenced
+# line/zone lives and which per-stream settings the recipes assume
+# (dwell_alert_s makes zone_dwell trigger events exist; speed.limit_kmh
+# makes speeding events exist). Replace it with your real cameras.
+# ---------------------------------------------------------------------------
+
+streams:
+  - id: example-cam
+    name: Reference geometry for the cookbook rules
+    source: rtsp://user:pass@10.0.0.11:554/stream1
+    enabled: false              # placeholder — swap in your camera
+    resize_width: 1280
+    calibration:                # required for recipe 6 (speed) — survey yours
+      image_points:  [[412, 512], [988, 500], [1160, 820], [212, 843]]
+      ground_points: [[0, 0],     [7.2, 0],   [7.2, 22.0], [0, 22.0]]
+    speed:
+      limit_kmh: 80             # recipe 6: the LOWEST per-class limit enforced
+    lines:
+      - id: gate                # recipe 4: forward = the legal direction
+        name: Main gate
+        points: [[220, 700], [1150, 690]]
+    zones:
+      - id: red-route           # recipe 1: curb lane of the no-stopping corridor
+        name: Red route curb lane
+        points: [[300, 640], [900, 620], [940, 720], [280, 740]]
+        dwell_alert_s: 8        # makes the zone emit zone_dwell trigger events
+      - id: shoulder            # recipe 2: hard shoulder
+        name: Hard shoulder
+        points: [[40, 620], [200, 600], [230, 860], [30, 870]]
+        dwell_alert_s: 20
+      - id: junction-box        # recipe 5: yellow-box area of the junction
+        name: Junction box
+        points: [[420, 380], [860, 370], [900, 560], [380, 570]]
+        dwell_alert_s: 45
+      - id: depot               # recipe 7: secured area perimeter
+        name: Secured depot
+        points: [[980, 200], [1240, 210], [1240, 460], [960, 450]]
+
+watchlists:
+  - id: stolen                  # recipe 3
+    name: Stolen vehicles
+    plates: ["34ABC123", "06XYZ42"]
+  - id: region-34-flagged       # recipe 8: exact plates only — no prefix matching
+    name: Flagged plates registered in province 34
+    plates: ["34KJH811", "34TC8532", "34VVD907"]
+
+rules:
+  # -- 1. Red-route enforcement: stopping is the violation --------------------
+  - id: red-route-stop
+    name: Stopped vehicle on red route
+    when: { type: zone_dwell, zone: red-route, min_seconds: 8 }
+    actions:
+      - { type: snapshot }
+      - { type: webhook, url: "https://ops.example.com/hooks/red-route" }
+    cooldown_s: 120             # one alert per offender per 2 minutes
+
+  # -- 2. Shoulder abuse: dwell triggers, class checked as state --------------
+  - id: truck-on-shoulder
+    name: Heavy vehicle on hard shoulder
+    when:
+      type: all_of              # the all_of idiom: one trigger + state predicates
+      conditions:
+        - { type: zone_dwell, zone: shoulder, min_seconds: 20 }
+        - { type: class_is, classes: [truck, bus] }
+    actions:
+      - { type: snapshot }
+      - { type: log, level: warning }
+
+  # -- 3. Stolen-vehicle interception ------------------------------------------
+  - id: stolen-vehicle
+    name: Stolen vehicle detected
+    when: { type: plate_watchlist, watchlist: stolen }
+    actions:
+      - { type: snapshot }
+      - { type: webhook, url: "https://dispatch.example.com/hooks/stolen", timeout_s: 3.0 }
+    cooldown_s: 5               # consecutive confirmations matter here
+
+  # -- 4. Wrong-way driver: life-safety, minimal cooldown ----------------------
+  - id: wrong-way
+    name: Wrong-way driver
+    when: { type: wrong_way, line: gate, allowed: forward }
+    actions:
+      - { type: snapshot }
+      - { type: webhook, url: "https://ops.example.com/hooks/wrong-way" }
+    cooldown_s: 5
+
+  # -- 5. Congestion dwell: blocked junction box --------------------------------
+  - id: junction-blocked
+    name: Vehicle stuck in junction box
+    when: { type: zone_dwell, zone: junction-box, min_seconds: 45 }
+    actions:
+      - { type: log, level: warning }
+      - { type: webhook, url: "https://ops.example.com/hooks/congestion" }
+    cooldown_s: 60
+
+  # -- 6. Speed by class: stream limit = lowest limit; rules filter upward ------
+  - id: truck-speeding
+    name: Truck/bus over 80
+    when: { type: speed, min_kmh: 80, classes: [truck, bus] }
+    actions: [{ type: snapshot }, { type: log, level: warning }]
+    cooldown_s: 30
+  - id: car-speeding
+    name: Any vehicle over 120
+    when: { type: speed, min_kmh: 120 }
+    actions: [{ type: snapshot }, { type: log, level: warning }]
+    cooldown_s: 30
+
+  # -- 7. Night-watch zone: any vehicle in the secured depot --------------------
+  # The DSL has no time-of-day predicate (stream clocks are media-relative);
+  # arm/disarm via `enabled`, or filter on wall_ts in the receiving system.
+  - id: depot-intrusion
+    name: Vehicle entered secured depot
+    when: { type: zone_enter, zone: depot }
+    actions:
+      - { type: snapshot }
+      - { type: webhook, url: "https://security.example.com/hooks/depot" }
+    cooldown_s: 300
+
+  # -- 8. Plate-region alerting: an exact watchlist per region ------------------
+  # Watchlists match exact normalized plates only — maintain the flagged list;
+  # for true prefix analytics consume plate_read events downstream instead
+  # (requires privacy.plate_storage: plain).
+  - id: region-alert
+    name: Flagged regional plate seen
+    when: { type: plate_watchlist, watchlist: region-34-flagged }
+    actions:
+      - { type: webhook, url: "https://ops.example.com/hooks/region-34" }
+    cooldown_s: 60

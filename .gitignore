@@ -1,0 +1,31 @@
+# build / env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.build-notes/
+
+# runtime data
+data/
+*.db
+*.db-journal
+
+# models / weights
+*.pt
+*.onnx
+*.engine
+*.ptl
+
+# tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,28 @@
+# ---------------------------------------------------------------------------
+# Canonical Panoptes vehicle-detector dataset config (ultralytics data yaml).
+#
+# The class ids below ARE the contract:
+#   * training/prepare/coco_to_yolo.py remaps COCO ids into this order,
+#   * the names must stay mappable by panoptes.detect.classmap.map_label
+#     so a fine-tuned model plugs into the platform without code changes.
+# Do not reorder ids after you started annotating.
+#
+# `path` is the dataset root on the training server; train/val/test are
+# relative to it. Ultralytics derives labels/ paths from images/ paths
+# (images/train/x.jpg -> labels/train/x.txt).
+# ---------------------------------------------------------------------------
+
+path: /data/datasets/vehicles
+train: images/train
+val: images/val
+test: images/test        # optional; remove if you keep no held-out split
+
+names:
+  0: car
+  1: van          # NOT in COCO -> needs Roboflow / own data (EGITIM.md section 2.4)
+  2: bus
+  3: truck
+  4: motorcycle
+  5: bicycle
+  6: emergency    # ambulance + police + fire aggregated; NOT in COCO either
+  7: person

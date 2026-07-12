@@ -1,0 +1,46 @@
+# Keep the build context to what the image install needs:
+# pyproject.toml, README.md, src/ (the dashboard ships inside the package
+# at src/panoptes/dashboard).
+
+# VCS / environments
+.git
+.gitignore
+.venv
+venv
+
+# runtime state & local data (never bake into images)
+data
+config
+*.db
+*.db-journal
+
+# model weights are pulled at runtime / mounted, not baked
+*.pt
+*.onnx
+*.engine
+*.ptl
+
+# docs, tests, training and deploy assets are not needed inside the image
+docs
+tests
+training
+examples
+deploy
+.build-notes
+
+# caches / tooling
+__pycache__
+*.pyc
+*.egg-info
+dist
+build
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# os / editor
+.DS_Store
+.idea
+.vscode
