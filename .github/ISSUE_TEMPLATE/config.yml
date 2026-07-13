@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security or privacy vulnerability
+    url: https://github.com/cleoanka/panoptes/security/advisories/new
+    about: Report vulnerabilities privately — please do NOT open a public issue.
+  - name: Documentation
+    url: https://github.com/cleoanka/panoptes/tree/main/docs
+    about: Architecture, API, rules, calibration, deployment, licensing and privacy guides.

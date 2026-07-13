@@ -1,0 +1,61 @@
+name: Bug report
+description: Report a defect in Panoptes
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. **Do not include real license plates, camera
+        feeds, or other personal data** in this report — use the synthetic
+        `panoptes demo` output or redacted examples. For security or privacy
+        vulnerabilities, follow [SECURITY.md](../blob/main/SECURITY.md) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Ideally against the mock detector (`panoptes demo`) so we can reproduce with no weights.
+      placeholder: |
+        1. Config used (redact secrets) ...
+        2. Command run ...
+        3. Observed ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Panoptes version / commit
+      placeholder: "0.1.0 or git SHA"
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.11 / 3.12 / 3.13"
+    validations:
+      required: true
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Detector backend
+      options:
+        - mock
+        - ultralytics
+        - rfdetr
+        - onnx
+        - tensorrt
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste logs or tracebacks (scrub API keys, DSNs and plates).
+      render: shell

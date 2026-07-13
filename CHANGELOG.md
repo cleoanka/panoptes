@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Static type checking is now gated: `mypy src` runs clean and is enforced
+  in the CI lint job and the `make lint` target.
+- Python 3.13 added to the CI test matrix (full suite green on 3.11/3.12/3.13).
+- `docs/demo.gif` hero clip in the README, generated offline by `panoptes demo`.
+- Community-health files: `CONTRIBUTING.md`, `SECURITY.md`,
+  `CODE_OF_CONDUCT.md`, GitHub issue/PR templates, and `.editorconfig`.
+
+### Changed
+- README CI badge switched from a static image to the live workflow-status
+  badge.
+
+### Fixed
+- Nine `mypy` type errors across `storage/db.py`, `observability/logging.py`,
+  `api/routes/events.py`, `detect/ultralytics_backend.py`, `pipeline/manager.py`
+  and `cli.py`.
+
 ## [0.1.0] - 2026-07-12
 
 Initial release.
