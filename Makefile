@@ -21,9 +21,10 @@ setup:
 test:
 	$(PY) -m pytest -q
 
-## lint: ruff over source, tests and deploy scripts.
+## lint: ruff over source/tests/deploy scripts + mypy over source.
 lint:
 	$(VENV)/bin/ruff check src tests deploy/scripts
+	$(VENV)/bin/mypy src
 
 ## serve: run the API + pipeline against the example config.
 serve:
