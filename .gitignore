@@ -9,6 +9,7 @@ build/
 
 # runtime data
 data/
+demo-out/
 *.db
 *.db-journal
 
