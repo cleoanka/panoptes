@@ -2,7 +2,7 @@
 
 **Multi-stream road & vehicle intelligence: detection, tracking, calibrated speed, ALPR and a declarative traffic-rules engine — in one deployable process.**
 
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions-2088FF?logo=githubactions&logoColor=white)](https://github.com/cleoanka/panoptes/actions)
+[![CI](https://github.com/cleoanka/panoptes/actions/workflows/ci.yml/badge.svg)](https://github.com/cleoanka/panoptes/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue?logo=python&logoColor=white)](pyproject.toml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](LICENSE)
 
@@ -11,6 +11,12 @@ intelligence: counted, classified, speed-measured vehicles with fused
 attributes and license plates, evaluated against rules you declare in YAML —
 served over a REST/SSE/WebSocket API with Prometheus metrics and a live
 dashboard.
+
+![Panoptes demo — synthetic traffic through the full pipeline: tracked and classified vehicles with per-track IDs, calibrated km/h speeds, a directed counting line and zone-dwell detection.](docs/demo.gif)
+
+> The clip above is produced entirely offline by `panoptes demo` (mock
+> detector, no model weights, no GPU) — tracking, calibrated speed, line
+> counting and zone dwell rendered on synthetic traffic.
 
 ## Why Panoptes
 
