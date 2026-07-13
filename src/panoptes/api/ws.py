@@ -46,7 +46,7 @@ async def events_ws(
 
     # Two concurrent waits: the next bus event, and the client socket
     # (to notice disconnects promptly instead of on the next failed send).
-    recv_task: asyncio.Task | None = asyncio.create_task(websocket.receive())
+    recv_task: asyncio.Task = asyncio.create_task(websocket.receive())
     get_task: asyncio.Task | None = None
     try:
         while True:

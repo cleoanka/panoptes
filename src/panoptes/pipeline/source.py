@@ -180,17 +180,22 @@ class OpenCvSource(FrameSource):
                     continue
                 if self.is_live and self._start_monotonic is None:
                     self._start_monotonic = time.monotonic()
-            ok, frame = self._cap.read()
+            # After the open block above self._cap is always set; bind it to a
+            # local so the type narrows and a concurrent close() can't null it
+            # out mid-read.
+            cap = self._cap
+            assert cap is not None
+            ok, frame = cap.read()
             if not ok or frame is None:
                 if self.is_live:
-                    self._cap.release()
+                    cap.release()
                     self._cap = None
                     self._backoff(f"read failed: {self._source}")
                     continue
                 if self._loop_file:
                     # keep timestamps monotonic across the rewind
                     self._ts_base = self._last_ts + 1.0 / (self.fps or 30.0)
-                    self._cap.release()
+                    cap.release()
                     self._cap = None
                     if not self._open():
                         raise StreamSourceError(f"cannot reopen looped file: {self._source}")

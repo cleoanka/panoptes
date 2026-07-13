@@ -48,9 +48,12 @@ async def purge_once(
             tracks = await session.execute(
                 delete(TrackRow).where(TrackRow.last_wall_ts < cutoff)
             )
-        counts["events"] = events.rowcount or 0
-        counts["plate_reads"] = plates.rowcount or 0
-        counts["tracks"] = tracks.rowcount or 0
+        # DELETE returns a CursorResult (has .rowcount); the base Result type
+        # the async stubs expose does not, so read it defensively — a backend
+        # that cannot report affected rows counts as zero.
+        counts["events"] = getattr(events, "rowcount", 0) or 0
+        counts["plate_reads"] = getattr(plates, "rowcount", 0) or 0
+        counts["tracks"] = getattr(tracks, "rowcount", 0) or 0
 
     if privacy_cfg.snapshot_retention_days is not None:
         cutoff = now - privacy_cfg.snapshot_retention_days * _DAY_S

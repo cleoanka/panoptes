@@ -97,6 +97,8 @@ asyncio_mode = "auto"
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.mypy]
-python_version = "3.11"
+# Match the actual .venv interpreter: numpy's 3.12 stubs use `type` statements
+# that mypy cannot parse under an older target (it aborts before checking).
+python_version = "3.12"
 ignore_missing_imports = true
 check_untyped_defs = true

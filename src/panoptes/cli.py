@@ -20,7 +20,7 @@ import time
 from collections import Counter as _Counter
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Literal, NoReturn, cast, get_args
 
 import numpy as np
 import typer
@@ -560,9 +560,23 @@ def benchmark(
     batch: int = typer.Option(8, "--batch", min=1, help="Frames per infer() call."),
 ) -> None:
     """Measure detector throughput and latency on synthetic frames."""
+    # ``backend`` arrives as a free-form str from Typer; narrow it to the
+    # DetectorConfig backend literal (kept in sync with the model field) so a
+    # bad value fails fast with a clear message instead of a pydantic dump.
+    valid_backends = get_args(DetectorConfig.model_fields["backend"].annotation)
+    if backend not in valid_backends:
+        _fail(
+            f"unknown backend '{backend}' (choose {', '.join(valid_backends)})",
+            code=2,
+        )
+    backend_literal = cast(
+        'Literal["ultralytics", "rfdetr", "onnx", "tensorrt", "mock"]', backend
+    )
     try:
-        det_cfg = DetectorConfig(backend=backend, model=model, imgsz=imgsz, max_batch=batch)
-    except Exception as exc:  # pydantic ValidationError (unknown backend literal)
+        det_cfg = DetectorConfig(
+            backend=backend_literal, model=model, imgsz=imgsz, max_batch=batch
+        )
+    except Exception as exc:  # pydantic ValidationError (bad numeric param, etc.)
         _fail(f"invalid benchmark parameters: {exc}", code=2)
     try:
         from panoptes.detect import create_detector
