@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 from collections.abc import AsyncIterator
+from enum import Enum
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -24,13 +25,13 @@ router = APIRouter(dependencies=[Depends(api_key_dependency)])
 _KEEPALIVE_S = 15.0  # SSE comment ping period so proxies don't cut idle streams
 
 
-def _validated(value: str | None, enum: type, param: str) -> str | None:
+def _validated(value: str | None, enum: type[Enum], param: str) -> str | None:
     if value is None:
         return None
     try:
-        return enum(value).value  # type: ignore[call-arg]
+        return str(enum(value).value)
     except ValueError as exc:
-        allowed = ", ".join(m.value for m in enum)  # type: ignore[var-annotated]
+        allowed = ", ".join(str(m.value) for m in enum)
         raise HTTPException(
             status_code=422, detail=f"invalid {param} '{value}'; expected one of: {allowed}"
         ) from exc

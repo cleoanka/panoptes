@@ -243,7 +243,7 @@ class PipelineManager:
         height, width = shape[:2]
         writer = cv2.VideoWriter(
             str(out),
-            cv2.VideoWriter_fourcc(*"mp4v"),
+            cv2.VideoWriter_fourcc(*"mp4v"),  # type: ignore[attr-defined]
             fps or 30.0,
             (width, height),
         )

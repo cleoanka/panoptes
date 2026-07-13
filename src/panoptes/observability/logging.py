@@ -11,10 +11,14 @@ from __future__ import annotations
 import logging
 import re
 import sys
+from typing import TYPE_CHECKING
 
 import structlog
 
 from panoptes.core.config import ObservabilityConfig
+
+if TYPE_CHECKING:
+    from structlog.typing import Processor
 
 __all__ = ["setup_logging"]
 
@@ -52,7 +56,7 @@ def setup_logging(config: ObservabilityConfig) -> None:
     timestamper = structlog.processors.TimeStamper(fmt="iso")
     # Runs on foreign (stdlib) records before rendering, and on
     # structlog events before they are handed to the stdlib formatter.
-    pre_chain = [
+    pre_chain: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_logger_name,
         structlog.stdlib.add_log_level,
@@ -71,6 +75,7 @@ def setup_logging(config: ObservabilityConfig) -> None:
         cache_logger_on_first_use=False,  # reconfiguration must take effect
     )
 
+    renderer_chain: list[Processor]
     if config.log_json:
         renderer_chain = [
             structlog.stdlib.ProcessorFormatter.remove_processors_meta,

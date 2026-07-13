@@ -42,7 +42,7 @@ class UltralyticsDetector(Detector):
                 "ultralytics",
                 "pip install 'panoptes[yolo]' (AGPL-3.0 — see docs/LICENSING.md)",
             ) from exc
-        self._model = YOLO(config.model)
+        self._model: Any = YOLO(config.model)
 
     def infer(self, frames: list[np.ndarray]) -> list[list[Detection]]:
         if not frames:

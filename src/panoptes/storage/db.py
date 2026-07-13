@@ -95,7 +95,10 @@ class _SessionScope:
     ) -> bool | None:
         try:
             assert self._session is not None
-            return await self._session.__aexit__(exc_type, exc, tb)
+            # AsyncSession.__aexit__ returns None (never suppresses); await
+            # it for cleanup and mirror that here.
+            await self._session.__aexit__(exc_type, exc, tb)
+            return None
         finally:
             if self._lock is not None:
                 self._lock.release()

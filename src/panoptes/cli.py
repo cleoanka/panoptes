@@ -18,7 +18,7 @@ import shutil
 import sys
 import time
 from collections import Counter as _Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal, NoReturn, cast, get_args
 
@@ -113,6 +113,7 @@ def _run_process_video(
     argument order but not keyword names, so the progress callback and the
     annotated-output path are passed by whichever keyword the pipeline
     build accepts (signature-inspected)."""
+    params: Mapping[str, inspect.Parameter]
     try:
         params = inspect.signature(manager.process_video).parameters
     except (TypeError, ValueError):
@@ -419,7 +420,10 @@ def _write_demo_video(path: Path, objects: list[dict[str, Any]], frames: int) ->
     for suffix, fourcc in ((".mp4", "mp4v"), (".avi", "MJPG")):
         actual = path.with_suffix(suffix)
         writer = cv2.VideoWriter(
-            str(actual), cv2.VideoWriter_fourcc(*fourcc), _DEMO_FPS, (_DEMO_W, _DEMO_H)
+            str(actual),
+            cv2.VideoWriter_fourcc(*fourcc),  # type: ignore[attr-defined]
+            _DEMO_FPS,
+            (_DEMO_W, _DEMO_H),
         )
         if writer.isOpened():
             break
