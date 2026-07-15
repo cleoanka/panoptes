@@ -478,6 +478,26 @@ class TestBuildDetections:
         )
         assert detections == []
 
+    def test_non_finite_boxes_dropped(self):
+        # A malformed/adversarial model emitting NaN/inf coords must be
+        # filtered, not crash the downstream (int(nan) raises ValueError).
+        xyxy = np.array(
+            [
+                [10, 20, 110, 120],           # car — clean, kept
+                [np.nan, 20, 110, 120],        # car — NaN x1, dropped
+                [10, np.inf, 110, 120],        # car — inf y1, dropped
+                [10, 20, 110, -np.inf],        # car — -inf y2, dropped
+            ],
+            dtype=np.float64,
+        )
+        scores = np.array([0.9, 0.9, 0.9, 0.9])
+        class_ids = np.array([2, 2, 2, 2])
+        detections = build_detections(
+            xyxy, scores, class_ids, COCO80_NAMES, mock_config(conf=0.25), self.FRAME_SHAPE
+        )
+        assert [d.vehicle_class for d in detections] == [VehicleClass.CAR]
+        assert detections[0].bbox.to_xyxy() == (10.0, 20.0, 110.0, 120.0)
+
 
 class TestClassTables:
     def test_coco80_vehicle_ids(self):

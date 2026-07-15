@@ -249,6 +249,8 @@ def build_detections(
     ids = np.asarray(class_ids).reshape(-1)
     detections: list[Detection] = []
     for box, score, cid in zip(boxes, confs, ids, strict=True):
+        if not np.isfinite(box).all():  # drop malformed/adversarial NaN/inf boxes
+            continue
         score_f = float(score)
         if score_f < config.conf:
             continue
