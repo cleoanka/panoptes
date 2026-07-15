@@ -69,6 +69,40 @@ class TestLineSegmentCrosses:
         seg = LineSegment.from_points([(1, 2), (3, 4)])
         assert (seg.ax, seg.ay, seg.bx, seg.by) == (1.0, 2.0, 3.0, 4.0)
 
+    @pytest.mark.parametrize("seed", [0, 1, 7, 42])
+    def test_direction_sign_consistency_over_random_pairs(self, seed: int) -> None:
+        # Property (arbitrary orientation): the sign of a crossing encodes the
+        # half-plane transition, and reversing the trajectory yields the
+        # opposite sign. A diagonal segment breaks the axis-aligned symmetry
+        # the other tests rely on, so both invariants are exercised generally:
+        #   * +1  <=>  side(p1) < 0 <= side(p2)   (neg -> pos)
+        #   * -1  <=>  side(p1) > 0 >= side(p2)   (pos -> neg)
+        #   * crosses(p1, p2) == -crosses(p2, p1) when neither endpoint lies
+        #     exactly on the line. The half-open convention (side == 0 belongs
+        #     to the positive half-plane) intentionally breaks that negation
+        #     when an endpoint sits on the line, so those cases are excluded.
+        rng = np.random.default_rng(seed)
+        seg = LineSegment(2.0, -3.0, 7.0, 5.0)
+        pts = rng.uniform(-10.0, 15.0, (2000, 2, 2))
+        crossings = 0
+        for (p1, p2) in pts:
+            a = (float(p1[0]), float(p1[1]))
+            b = (float(p2[0]), float(p2[1]))
+            c = seg.crosses(a, b)
+            assert c in (-1, 0, 1)
+            if c == 1:
+                assert seg.side(*a) < 0 <= seg.side(*b)
+                crossings += 1
+            elif c == -1:
+                assert seg.side(*a) > 0 >= seg.side(*b)
+                crossings += 1
+            # Anti-symmetry, guarded against the on-line (side == 0) case.
+            if seg.side(*a) != 0.0 and seg.side(*b) != 0.0:
+                assert seg.crosses(a, b) == -seg.crosses(b, a)
+        # The sampled band straddles the segment, so crossings actually occur;
+        # a zero count would mean the property was never meaningfully tested.
+        assert crossings > 0
+
 
 # --------------------------------------------------------------------
 # bbox_ious — vectorised IoU used by ByteTrack matching
@@ -120,6 +154,32 @@ class TestBBoxIous:
             for j in range(4):
                 scalar = BBox(*a[i]).iou(BBox(*b[j]))
                 assert mat[i, j] == pytest.approx(scalar, abs=1e-6)
+
+    @pytest.mark.parametrize("seed", [0, 1, 7, 42])
+    def test_symmetry_and_unit_bounds_over_random_matrices(self, seed: int) -> None:
+        # Property: IoU is symmetric and confined to [0, 1]. bbox_ious feeds
+        # ByteTrack's greedy matcher (gated by iou >= min_iou), so an
+        # asymmetry or out-of-range value would silently corrupt association.
+        # Boxes are built as (top-left) + (positive width/height) so every box
+        # is valid; coordinates range into the negatives to stress the guards.
+        rng = np.random.default_rng(seed)
+
+        def random_boxes(count: int) -> np.ndarray:
+            xy = rng.uniform(-50.0, 100.0, (count, 2))
+            wh = rng.uniform(0.0, 30.0, (count, 2))
+            return np.hstack([xy, xy + wh]).astype(np.float32)
+
+        for _ in range(200):
+            a = random_boxes(int(rng.integers(1, 6)))
+            b = random_boxes(int(rng.integers(1, 6)))
+            ab = bbox_ious(a, b)
+            ba = bbox_ious(b, a)
+            # iou(a, b) == iou(b, a).T, exactly (identical float ops).
+            assert np.array_equal(ab, ba.T)
+            # 0 <= iou <= 1, with no NaN leaking from the zero-union guard.
+            assert not np.isnan(ab).any()
+            assert ab.min() >= 0.0
+            assert ab.max() <= 1.0
 
 
 # --------------------------------------------------------------------
