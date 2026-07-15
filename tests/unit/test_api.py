@@ -525,6 +525,52 @@ async def test_sse_hashed_mode_redacts_plate(app_client) -> None:
     assert payload["data"]["valid"] is True  # non-plate keys untouched
 
 
+async def test_sse_emits_strict_json_for_non_finite_floats(app_client) -> None:
+    # A non-finite float in event.data (e.g. an early speed estimate) must
+    # not leak NaN/Infinity into the stream: those are invalid JSON and
+    # break strict parsers. Match the REST layer (allow_nan=False) and
+    # coerce to null instead.
+    client, app = app_client
+    bus = app.state.panoptes.bus
+    stop = asyncio.Event()
+
+    def _bad_event() -> Event:
+        return Event(
+            type=EventType.SPEEDING,
+            stream_id="cam1",
+            timestamp=1.5,
+            wall_ts=time.time(),
+            track_id=7,
+            vehicle_class="car",
+            data={"speed_kmh": float("nan"), "direction": "forward"},
+        )
+
+    async def pump() -> None:
+        while not stop.is_set():
+            bus.publish(_bad_event())
+            await asyncio.sleep(0.02)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        with anyio.fail_after(10):
+            resp = await client.get(
+                "/api/v1/events/stream",
+                params={"limit": 1, "types": "speeding"},
+                headers=AUTH,
+            )
+    finally:
+        stop.set()
+        await pump_task
+
+    assert resp.status_code == 200
+    data_lines = [line for line in resp.text.splitlines() if line.startswith("data: ")]
+    raw = data_lines[0].removeprefix("data: ")
+    assert "NaN" not in raw and "Infinity" not in raw
+    payload = json.loads(raw)  # strict parser: rejects NaN/Infinity tokens
+    assert payload["data"]["speed_kmh"] is None
+    assert payload["data"]["direction"] == "forward"  # finite keys untouched
+
+
 # ------------------------------------------------------------------
 # WebSocket feed
 # ------------------------------------------------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 from collections.abc import AsyncIterator
 from enum import Enum
 from typing import Any
@@ -35,6 +36,29 @@ def _validated(value: str | None, enum: type[Enum], param: str) -> str | None:
         raise HTTPException(
             status_code=422, detail=f"invalid {param} '{value}'; expected one of: {allowed}"
         ) from exc
+
+
+def _strict_json(payload: dict[str, Any]) -> str:
+    # Match the REST layer's serializer (Starlette JSONResponse uses
+    # allow_nan=False): NaN/Infinity are not valid JSON and break strict
+    # parsers. A non-finite float can reach the live feed via event.data
+    # (e.g. a speed estimate before enough samples). Coerce those to null
+    # rather than letting json.dumps emit non-standard tokens, and keep the
+    # SSE generator alive instead of raising mid-stream.
+    try:
+        return json.dumps(payload, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(payload), allow_nan=False)
+
+
+def _finite(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -101,7 +125,7 @@ async def stream_events(
                         continue
                     # In hashed plate-storage mode the live feed must match
                     # the at-rest representation: plate text goes out hashed.
-                    yield f"data: {json.dumps(redact_event_dict(event.to_dict(), state))}\n\n"
+                    yield f"data: {_strict_json(redact_event_dict(event.to_dict(), state))}\n\n"
                     sent += 1
                     if limit is not None and sent >= limit:
                         return
