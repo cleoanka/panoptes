@@ -121,14 +121,17 @@ async def stream_events(
                 except TimeoutError:
                     yield ": ping\n\n"
                 else:
-                    if wanted is not None and event.type.value not in wanted:
-                        continue
-                    # In hashed plate-storage mode the live feed must match
-                    # the at-rest representation: plate text goes out hashed.
-                    yield f"data: {_strict_json(redact_event_dict(event.to_dict(), state))}\n\n"
-                    sent += 1
-                    if limit is not None and sent >= limit:
-                        return
+                    # A filtered-out event yields nothing, but must still fall
+                    # through to the disconnect check below: otherwise a busy
+                    # all-filtered stream never times out and a dead client
+                    # leaks its bus subscription (its queue is drained forever).
+                    if wanted is None or event.type.value in wanted:
+                        # In hashed plate-storage mode the live feed must match
+                        # the at-rest representation: plate text goes out hashed.
+                        yield f"data: {_strict_json(redact_event_dict(event.to_dict(), state))}\n\n"
+                        sent += 1
+                        if limit is not None and sent >= limit:
+                            return
                 if await request.is_disconnected():
                     return
         finally:

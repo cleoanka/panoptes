@@ -31,6 +31,7 @@ from panoptes.api import create_app
 from panoptes.api.app import AppState
 from panoptes.api.auth import require_component
 from panoptes.api.jobs import JobRegistry
+from panoptes.api.routes.events import stream_events
 from panoptes.api.schemas import scrub_url
 from panoptes.core.config import (
     AppConfig,
@@ -603,6 +604,42 @@ async def test_sse_emits_strict_json_for_non_finite_floats(app_client) -> None:
     payload = json.loads(raw)  # strict parser: rejects NaN/Infinity tokens
     assert payload["data"]["speed_kmh"] is None
     assert payload["data"]["direction"] == "forward"  # finite keys untouched
+
+
+async def test_sse_stream_checks_disconnect_on_filtered_out_events(app_client) -> None:
+    # A busy all-filtered stream must still reach the is_disconnected()
+    # backstop: otherwise the generator spins forever on queue.get()->skip,
+    # never yields, never times out, and a dead client leaks its bus
+    # subscription. Drive generate() directly with a disconnected request.
+    _client, app = app_client
+    bus = app.state.panoptes.bus
+
+    class _DisconnectedRequest:
+        def __init__(self, application: Any) -> None:
+            self.app = application
+
+        async def is_disconnected(self) -> bool:
+            return True
+
+    request = _DisconnectedRequest(app)
+    resp = await stream_events(request, types="speeding", limit=None)  # type: ignore[arg-type]
+
+    # Only filtered-out events arrive, faster than the 15s keepalive.
+    async def pump() -> None:
+        for _ in range(5):
+            bus.publish(_event(EventType.LINE_CROSSED))  # not "speeding"
+            await asyncio.sleep(0)
+
+    pump_task = asyncio.create_task(pump())
+    try:
+        with anyio.fail_after(10):
+            chunks = [chunk async for chunk in resp.body_iterator]
+    finally:
+        await pump_task
+
+    # Generator terminated (no data lines yielded) and unsubscribed cleanly.
+    assert not any(chunk.startswith("data: ") for chunk in chunks)
+    assert not bus._subscribers  # the finally block ran, no leaked subscription
 
 
 # ------------------------------------------------------------------
