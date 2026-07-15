@@ -31,8 +31,11 @@ __all__ = [
 
 _M = TypeVar("_M", bound=BaseModel)
 
-# scheme://userinfo@rest — the userinfo part of RTSP/DB URLs carries credentials
-_USERINFO_RE = re.compile(r"^(\w[\w+.-]*://)([^/@]+)@(.*)$")
+# scheme://userinfo@rest — the userinfo part of RTSP/DB URLs carries credentials.
+# ``userinfo`` matches greedily up to the LAST '@' before the host so an
+# unencoded '@' in the password (e.g. ``user:p@ss@host``) is fully masked and
+# does not leak; ``[^@/]`` anchors the host so a '@' in the path is left alone.
+_USERINFO_RE = re.compile(r"^(\w[\w+.-]*://)([^/]+)@([^@/]*.*)$")
 
 
 def scrub_url(url: str) -> str:

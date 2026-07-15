@@ -28,6 +28,7 @@ import panoptes.pipeline
 import panoptes.storage
 from panoptes.api import create_app
 from panoptes.api.jobs import JobRegistry
+from panoptes.api.schemas import scrub_url
 from panoptes.core.config import (
     AppConfig,
     DatabaseConfig,
@@ -286,6 +287,31 @@ async def test_config_redacts_secrets(app_client) -> None:
     assert body["privacy"]["hash_salt"] == "***"
     assert body["rules"][0]["actions"][0]["url"] == "***"
     assert "***@cam.local" in body["streams"][0]["source"]
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("rtsp://user:pass@cam.local:554/stream", "rtsp://***@cam.local:554/stream"),
+        # Unencoded '@' in the password must not leak trailing bytes: userinfo
+        # runs up to the LAST '@' before the host, not the first.
+        ("rtsp://user:p@ss@cam.local:554/stream", "rtsp://***@cam.local:554/stream"),
+        ("postgresql://u:p@ss@db.local:5432/panoptes", "postgresql://***@db.local:5432/panoptes"),
+        ("rtsp://user@cam.local/stream", "rtsp://***@cam.local/stream"),
+        # A '@' living in the path (not the authority) is left untouched.
+        ("https://key:tok@api.local/v1@ref", "https://***@api.local/v1@ref"),
+        # No credentials / not a URL: passed through unchanged.
+        ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
+        ("not-a-url", "not-a-url"),
+    ],
+)
+def test_scrub_url_masks_userinfo(url: str, expected: str) -> None:
+    scrubbed = scrub_url(url)
+    assert scrubbed == expected
+    # Whatever password bytes were present must be fully gone.
+    for secret in ("pass", "p@ss", "tok"):
+        if f":{secret}@" in url or f"//{secret}@" in url:
+            assert secret not in scrubbed
 
 
 async def test_metrics_endpoint(app_client) -> None:
