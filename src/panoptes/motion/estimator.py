@@ -147,13 +147,18 @@ class MotionEstimator:
             for p in track.points
             if p.ground is not None
         ]
-        # At least two grounded observations inside the window: a track
-        # re-acquired after a long occlusion must not report a speed
+        # A reference must exist *inside* the window (the current point is
+        # already in-window, so one prior in-window point makes two): a
+        # track re-acquired after a long occlusion must not report a speed
         # computed across the gap.
-        windowed = sum(1 for ts, _, _ in grounded if ts >= window_start)
-        if windowed < 2:
+        in_window = [g for g in grounded[:-1] if g[0] >= window_start]
+        if not in_window:
             return
-        ref_ts, ref_x, ref_y = min(grounded[:-1], key=lambda g: abs(g[0] - window_start))
+        # Take the reference from inside the window only. The globally
+        # closest point to ``window_start`` could be a pre-gap point just
+        # before the boundary, silently spanning the occlusion — exactly
+        # what the in-window requirement above exists to prevent.
+        ref_ts, ref_x, ref_y = min(in_window, key=lambda g: abs(g[0] - window_start))
         dt = current.timestamp - ref_ts
         if dt <= _MIN_DT_S:
             return

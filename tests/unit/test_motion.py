@@ -125,6 +125,23 @@ def test_no_speed_across_reacquisition_gap() -> None:
     assert track.speed_kmh is None
 
 
+def test_reference_never_taken_from_before_the_window() -> None:
+    # Two grounded points inside the 1 s window satisfy the guard, but a
+    # pre-gap point sits *just* before window_start. Measuring against that
+    # closer-to-the-boundary point would span the occlusion; the reference
+    # must come from inside the window instead.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    for t in (0.0, 4.0, 8.0, 8.9):  # parked at 10 m, last hit just pre-window
+        advance(track, t, 100.0, 50.0)
+    advance(track, 9.5, 105.0, 50.0)  # re-acquired: +0.5 m ground
+    advance(track, 10.0, 106.0, 50.0)  # +0.1 m more, window_start = 9.0
+    estimator.process([track], "cam1", WALL_T0 + 10.0)
+    # In-window motion is 0.1 m over 0.5 s == 0.72 km/h. Referencing the
+    # pre-window point (8.9 s, 10 m) would give 0.6 m / 1.1 s ~ 1.96 km/h.
+    assert track.speed_kmh == pytest.approx(0.72, rel=1e-3)
+
+
 # ----------------------------------------------------------------------
 # golden: SPEEDING events
 # ----------------------------------------------------------------------
