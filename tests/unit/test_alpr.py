@@ -174,6 +174,61 @@ class TestPlateVoter:
         voter.add_read(1, "34ABC123", 0.9)
         assert voter.add_read(2, "34ABC123", 0.9) is None  # track 2 has 1 read
 
+    def test_slot_tie_breaks_by_codepoint_not_arrival_order(self) -> None:
+        # Slot 0 is an exact weight tie: {'0': 1.418, '9': 1.418, '3': 0.784}.
+        # Bare max() would let whichever read arrived first win, so the same
+        # multiset fed in two orders emitted two different plates. The fix
+        # breaks the tie on the lower codepoint ('0' < '9'), independent of order.
+        reads = [
+            ("0026B37", 0.603),
+            ("9006B37", 0.447),
+            ("9006B37", 0.971),
+            ("3302B3A", 0.784),
+            ("00CC537", 0.815),
+        ]
+        forward, _ = PlateVoter(1)._consensus(reads)
+        reverse, _ = PlateVoter(1)._consensus(list(reversed(reads)))
+        assert forward == reverse == "0006B37"
+
+    @pytest.mark.parametrize("seed", range(20))
+    def test_consensus_stable_under_read_permutation(self, seed: int) -> None:
+        # Property: the consensus plate is a function of the read *multiset*
+        # alone — permuting the arrival order of the same reads must not change
+        # _dominant_group + _consensus, nor the emitted PlateRead.text. This is
+        # the invariant whose absence hid the per-slot tie bug above.
+        rng = np.random.default_rng(seed)
+        alphabet = "0123456789ABCDEFGHIJ"
+        base = "".join(rng.choice(list(alphabet), size=8))
+        reads: list[tuple[str, float]] = []
+        for _ in range(int(rng.integers(4, 10))):
+            chars = list(base)
+            for j in range(len(chars)):
+                if rng.random() < 0.3:  # per-char corruption
+                    chars[j] = str(rng.choice(list(alphabet)))
+            text = "".join(chars)
+            if rng.random() < 0.15:  # occasional length change -> outlier group
+                text = text[:-1]
+            # Coarse confidences deliberately provoke exact-weight ties.
+            reads.append((text, float(rng.choice([0.5, 0.75, 1.0]))))
+
+        def final_consensus(order: list[tuple[str, float]]) -> tuple[str, str | None]:
+            voter = PlateVoter(vote_min_reads=2)
+            emitted: str | None = None
+            for text, conf in order:
+                out = voter.add_read(1, text, conf)
+                if out is not None:
+                    emitted = out.text
+            group = voter._dominant_group([(t, max(c, 1e-6)) for t, c in order])
+            return voter._consensus(group)[0], emitted
+
+        baseline_group, baseline_emitted = final_consensus(reads)
+        for _ in range(8):
+            shuffled = list(reads)
+            rng.shuffle(shuffled)
+            group_text, emitted = final_consensus(shuffled)
+            assert group_text == baseline_group
+            assert emitted == baseline_emitted
+
 
 # --------------------------------------------------------------------
 # correct_and_validate — structure-aware OCR correction
