@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from panoptes.core.config import CalibrationConfig, SpeedConfig
+from panoptes.core.config import CalibrationConfig, SpeedConfig, StoppedVehicleConfig
 from panoptes.core.errors import CalibrationError
 from panoptes.core.events import EventType
 from panoptes.core.geometry import BBox
@@ -184,6 +184,100 @@ def test_under_limit_no_events() -> None:
     track = make_track()
     events = run_constant_velocity(estimator, track, seconds=3.0)
     assert events == []
+
+
+# ----------------------------------------------------------------------
+# golden: STOPPED_VEHICLE events
+# ----------------------------------------------------------------------
+def run_stationary(
+    estimator: MotionEstimator,
+    track: Track,
+    *,
+    seconds: float,
+    fps: float = 10.0,
+    at: tuple[float, float] = (50.0, 50.0),
+):
+    """Park a vehicle at a fixed pixel: one point + one process() per frame."""
+    events = []
+    for i in range(round(seconds * fps) + 1):
+        t = i / fps
+        advance(track, t, at[0], at[1])
+        events.extend(estimator.process([track], "cam1", WALL_T0 + t))
+    return events
+
+
+def test_stopped_fires_once_after_dwell() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=5.0)
+    stops = [e for e in events if e.type is EventType.STOPPED_VEHICLE]
+    assert len(stops) == 1
+    event = stops[0]
+    assert event.stream_id == "cam1"
+    assert event.track_id == 1
+    assert event.vehicle_class == "car"
+    assert event.data["threshold_kmh"] == 3.0
+    assert event.data["speed_kmh"] <= 3.0
+    assert event.data["stopped_s"] >= 2.0
+    assert event.wall_ts == pytest.approx(WALL_T0 + event.timestamp)
+    assert track.data["stopped_emitted_ts"] == pytest.approx(event.timestamp)
+
+
+def test_stopped_reemits_after_30s() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=35.0)
+    stops = [e for e in events if e.type is EventType.STOPPED_VEHICLE]
+    assert len(stops) == 2
+    assert stops[1].timestamp - stops[0].timestamp >= 30.0
+
+
+def test_stopped_disabled_by_default() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=5.0)
+    assert [e for e in events if e.type is EventType.STOPPED_VEHICLE] == []
+
+
+def test_stopped_not_fired_while_moving() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=5.0)  # 72 km/h
+    assert [e for e in events if e.type is EventType.STOPPED_VEHICLE] == []
+
+
+def test_stopped_dwell_resets_when_vehicle_moves() -> None:
+    from panoptes.motion.estimator import _STOPPED_SINCE_KEY
+
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=5.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    fps = 10.0
+    # Park briefly (under the 5 s dwell): stopped_since is recorded.
+    for i in range(20):  # t = 0.0 .. 1.9
+        t = i / fps
+        advance(track, t, 50.0, 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+    assert _STOPPED_SINCE_KEY in track.data
+    # Now drive off from where it stopped: the dwell must clear.
+    for i in range(20, 40):  # t = 2.0 .. 3.9, +20 px/step == 72 km/h
+        t = i / fps
+        advance(track, t, 50.0 + 20.0 * (i - 19), 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+    assert track.speed_kmh is not None and track.speed_kmh > 3.0
+    assert _STOPPED_SINCE_KEY not in track.data
+
+
+def test_stopped_requires_calibration() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(None, SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=5.0)
+    assert events == []
+    assert track.speed_kmh is None
 
 
 # ----------------------------------------------------------------------

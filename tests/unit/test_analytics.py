@@ -178,6 +178,41 @@ class TestLineCounter:
         assert events == []
         assert counter.total("eastbound") == 0
 
+    def test_no_wrong_way_when_direction_unset(self) -> None:
+        counter = LineCounter(LINE)  # allowed_direction defaults to None
+        track = make_track()
+        # Backward pass would be wrong-way if a direction were enforced.
+        events = drive(counter, track, [130.0, 120.0, 110.0, 90.0, 70.0, 60.0])
+        assert [e.type for e in events] == [EventType.LINE_CROSSED]
+        assert events[0].data["direction_canonical"] == "backward"
+
+    def test_wrong_way_emitted_against_allowed_direction(self) -> None:
+        cfg = LINE.model_copy(update={"allowed_direction": "forward"})
+        counter = LineCounter(cfg)
+        track = make_track()
+        # Right-to-left = backward = opposes the allowed 'forward'.
+        events = drive(counter, track, [130.0, 120.0, 110.0, 90.0, 70.0, 60.0])
+        assert [e.type for e in events] == [EventType.LINE_CROSSED, EventType.WRONG_WAY]
+        crossed, wrong = events
+        assert crossed.data["direction_canonical"] == "backward"
+        assert wrong.track_id == track.track_id
+        assert wrong.vehicle_class == "car"
+        assert wrong.data == {
+            "line": "l1",
+            "line_name": "Main gate",
+            "direction_canonical": "backward",
+            "allowed_direction": "forward",
+        }
+
+    def test_no_wrong_way_when_crossing_matches_allowed(self) -> None:
+        cfg = LINE.model_copy(update={"allowed_direction": "forward"})
+        counter = LineCounter(cfg)
+        track = make_track()
+        # Left-to-right = forward = the allowed direction: no wrong-way.
+        events = drive(counter, track, [60.0, 80.0, 90.0, 110.0, 130.0, 150.0])
+        assert [e.type for e in events] == [EventType.LINE_CROSSED]
+        assert events[0].data["direction_canonical"] == "forward"
+
 
 # ---------------------------------------------------------------------
 # zones

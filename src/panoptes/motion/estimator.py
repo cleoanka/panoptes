@@ -51,6 +51,14 @@ _MIN_DT_S = 1e-6
 # A track re-emits SPEEDING at most this often (stream-relative seconds).
 _SPEEDING_REEMIT_S = 30.0
 
+# A track re-emits STOPPED_VEHICLE at most this often (stream-relative
+# seconds), mirroring the SPEEDING throttle.
+_STOPPED_REEMIT_S = 30.0
+
+# Track.data key holding the timestamp of the first dip below the stopped
+# threshold in the current stationary spell (cleared when speed rises).
+_STOPPED_SINCE_KEY = "_stopped_since_ts"
+
 
 class MotionEstimator:
     """Fills ``TrackPoint.ground`` and derives per-track kinematics.
@@ -93,6 +101,9 @@ class MotionEstimator:
             event = self._maybe_speeding(track, stream_id, wall_ts)
             if event is not None:
                 events.append(event)
+            stopped = self._maybe_stopped(track, stream_id, wall_ts)
+            if stopped is not None:
+                events.append(stopped)
         return events
 
     # ------------------------------------------------------------------
@@ -203,6 +214,39 @@ class MotionEstimator:
             track_id=track.track_id,
             vehicle_class=track.vehicle_class.value,
             data={"speed_kmh": round(track.speed_kmh, 1), "limit_kmh": limit},
+        )
+
+    def _maybe_stopped(self, track: Track, stream_id: str, wall_ts: float) -> Event | None:
+        stopped = self._speed.stopped
+        if not stopped.enabled or track.speed_kmh is None:
+            return None
+        now = track.last_timestamp
+        if track.speed_kmh > stopped.max_speed_kmh:
+            # Moving again: reset the dwell so the next stop is timed afresh.
+            track.data.pop(_STOPPED_SINCE_KEY, None)
+            return None
+        since = track.data.get(_STOPPED_SINCE_KEY)
+        if since is None:
+            track.data[_STOPPED_SINCE_KEY] = now
+            return None
+        if (now - float(since)) < stopped.min_stopped_s:
+            return None
+        last_emitted = track.data.get("stopped_emitted_ts")
+        if last_emitted is not None and (now - float(last_emitted)) < _STOPPED_REEMIT_S:
+            return None
+        track.data["stopped_emitted_ts"] = now
+        return Event(
+            type=EventType.STOPPED_VEHICLE,
+            stream_id=stream_id,
+            timestamp=now,
+            wall_ts=wall_ts,
+            track_id=track.track_id,
+            vehicle_class=track.vehicle_class.value,
+            data={
+                "speed_kmh": round(track.speed_kmh, 1),
+                "threshold_kmh": stopped.max_speed_kmh,
+                "stopped_s": round(now - float(since), 1),
+            },
         )
 
 

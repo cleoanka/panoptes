@@ -44,6 +44,7 @@ __all__ = [
     "ServerConfig",
     "SnapshotConfig",
     "SpeedConfig",
+    "StoppedVehicleConfig",
     "StreamConfig",
     "TrackerConfig",
     "WatchlistConfig",
@@ -103,12 +104,25 @@ class CalibrationConfig(BaseModel):
         return self
 
 
+class StoppedVehicleConfig(BaseModel):
+    """Detects a vehicle that stays (nearly) stationary for a dwell.
+
+    Rides on the same calibrated speed estimate as SPEEDING: a track whose
+    smoothed speed stays ``<= max_speed_kmh`` continuously for at least
+    ``min_stopped_s`` emits one STOPPED_VEHICLE event."""
+
+    enabled: bool = False
+    max_speed_kmh: float = 3.0   # at or below this counts as 'stopped'
+    min_stopped_s: float = 10.0  # dwell below the threshold before alerting
+
+
 class SpeedConfig(BaseModel):
     enabled: bool = True
     window_s: float = 1.0        # sliding window for velocity estimation
     min_track_s: float = 0.7     # don't report speed for younger tracks
     ema_alpha: float = 0.35      # exponential smoothing of the km/h value
     limit_kmh: float | None = None  # emits SPEEDING events when exceeded
+    stopped: StoppedVehicleConfig = Field(default_factory=StoppedVehicleConfig)
 
 
 class AlprConfig(BaseModel):
@@ -159,6 +173,9 @@ class LineConfig(BaseModel):
     classes: list[VehicleClass] | None = None
     forward_label: str = "forward"
     backward_label: str = "backward"
+    # When set, a crossing whose canonical direction differs also emits a
+    # WRONG_WAY primitive (None disables — the line is bidirectional).
+    allowed_direction: Literal["forward", "backward"] | None = None
 
     @field_validator("points")
     @classmethod
