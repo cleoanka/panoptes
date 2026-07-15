@@ -9,6 +9,7 @@ layer, never here.
 from __future__ import annotations
 
 import logging
+import math
 from typing import TYPE_CHECKING
 
 from panoptes.alpr.detector import PlateDetector
@@ -102,7 +103,10 @@ class AlprPipeline:
             if crop is None:
                 continue
             text, conf = self._ocr.read(crop)
-            if not text or conf < self.config.min_ocr_confidence:
+            # A non-finite conf (NaN/inf from a degenerate OCR probability array)
+            # slips past ``conf < threshold`` and poisons the voter; treat it as
+            # a failed read.
+            if not text or not math.isfinite(conf) or conf < self.config.min_ocr_confidence:
                 continue
             result = correct_and_validate(text, self.config.country)
             if not result.valid and self.config.country is not None:

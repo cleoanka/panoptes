@@ -483,6 +483,19 @@ class TestAlprPipeline:
             assert pipe.process(FRAME, [track], i, i * 0.04, 1000.0 + i, "s1") == []
         assert track.plate is None
 
+    def test_nonfinite_ocr_confidence_discarded(self, fake_alpr: _FakeBackend) -> None:
+        # A NaN slot probability yields conf=NaN; `NaN < threshold` is False, so
+        # without the finiteness guard the read would slip past the gate and
+        # poison the voter. It must be dropped like a failed read.
+        fake_alpr.plates = [(200, 300, 280, 330, 0.9)]
+        fake_alpr.ocr_probs = np.array([[0.9] * 7 + [np.nan]])  # matches "34ABC123"
+        pipe = AlprPipeline(make_config(), [], PrivacyConfig())
+        track = make_track()
+        for i in range(3):
+            assert pipe.process(FRAME, [track], i, i * 0.04, 1000.0 + i, "s1") == []
+        assert track.plate is None
+        assert pipe._voter.tracked_ids() == set()
+
     def test_unassigned_plate_dropped(self, fake_alpr: _FakeBackend) -> None:
         fake_alpr.plates = [(500, 420, 560, 450, 0.9)]  # outside track bbox, IoU 0
         pipe = AlprPipeline(make_config(), [], PrivacyConfig())
