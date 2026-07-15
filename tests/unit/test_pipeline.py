@@ -453,6 +453,43 @@ def test_scheduler_submit_racing_close_never_orphans_future():
     )
 
 
+def test_scheduler_close_leaves_queue_to_thread_when_join_times_out():
+    """A detector wedged past the join timeout must stay the sole queue
+    consumer: close() must not drain (and swallow the sentinel) while the
+    scheduler thread is still alive, or that thread blocks on get() forever."""
+    detector = GateDetector()
+    scheduler = InferenceScheduler(detector, max_batch=8, max_delay_ms=20)
+    real_join = scheduler._thread.join
+    try:
+        # Wedge the scheduler thread inside the first infer() (gate never set
+        # before close), then pile a submission up behind it.
+        sacrificial = threading.Thread(target=scheduler.infer, args=(_marked_frame(1),))
+        sacrificial.start()
+        wait_for(detector.first_call_seen.is_set, message="first batch pickup")
+        racer = scheduler.submit(_marked_frame(2))
+        wait_for(lambda: scheduler._queue.qsize() >= 1, message="queued submission")
+
+        # Simulate the 30s join expiring while the detector is still wedged.
+        scheduler._thread.join = lambda timeout=None: None  # type: ignore[method-assign]
+        scheduler.close()
+        scheduler._thread.join = real_join  # type: ignore[method-assign]
+
+        # close() must not have consumed the sentinel or the raced future:
+        # the still-alive thread owns the queue and will drain it itself.
+        assert scheduler._thread.is_alive()
+        assert not racer.done()
+
+        # Once the detector unblocks, the thread's own _drain() resolves the
+        # raced future and observes the preserved sentinel to exit cleanly.
+        detector.gate.set()
+        assert racer.result(timeout=5.0)[0].class_id == 2
+        scheduler._thread.join(timeout=5.0)
+        assert not scheduler._thread.is_alive()
+    finally:
+        detector.gate.set()
+        sacrificial.join(5.0)
+
+
 # ---------------------------------------------------------------------
 # annotate
 # ---------------------------------------------------------------------

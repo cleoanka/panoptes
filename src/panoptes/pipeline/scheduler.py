@@ -141,6 +141,14 @@ class InferenceScheduler:
             # can enqueue a future in the window after we finish draining.
             self._queue.put(_SENTINEL)
             self._thread.join(timeout=30.0)
+            if self._thread.is_alive():
+                # A wedged detector outran the join. The scheduler thread is
+                # still the sole queue consumer and its sentinel is unconsumed;
+                # draining here would race it and swallow the sentinel, leaving
+                # it blocked forever. Leave the queue to the daemon thread — it
+                # runs its own _drain() (failing raced futures) once infer()
+                # returns. Return without claiming the thread is torn down.
+                return
             # Submissions that raced close() land behind the sentinel: fail them
             # so no worker is left blocked on an orphan future.
             while True:
