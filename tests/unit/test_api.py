@@ -650,6 +650,34 @@ def test_ws_plain_mode_passes_plate_through(fakes: None, tmp_path: Path) -> None
     assert message["data"]["plate"] == RAW_PLATE
 
 
+def test_ws_emits_strict_json_for_non_finite_floats(fakes: None, tmp_path: Path) -> None:
+    # Mirror of test_sse_emits_strict_json_for_non_finite_floats for the WS
+    # transport: a non-finite float in event.data must not leak NaN/Infinity
+    # (invalid JSON) into the socket; coerce to null like the SSE feed does.
+    app = create_app(make_config(tmp_path))
+    with TestClient(app) as tc:
+        bus = app.state.panoptes.bus
+        with tc.websocket_connect(
+            f"/api/v1/events/ws?api_key={API_KEY}&types=speeding"
+        ) as ws:
+            bus.publish(
+                Event(
+                    type=EventType.SPEEDING,
+                    stream_id="cam1",
+                    timestamp=1.5,
+                    wall_ts=time.time(),
+                    track_id=7,
+                    vehicle_class="car",
+                    data={"speed_kmh": float("nan"), "direction": "forward"},
+                )
+            )
+            raw = ws.receive_text()
+    assert "NaN" not in raw and "Infinity" not in raw
+    payload = json.loads(raw)  # strict parser: rejects NaN/Infinity tokens
+    assert payload["data"]["speed_kmh"] is None
+    assert payload["data"]["direction"] == "forward"  # finite keys untouched
+
+
 def test_ws_rejects_bad_key(fakes: None, tmp_path: Path) -> None:
     app = create_app(make_config(tmp_path))
     with (
