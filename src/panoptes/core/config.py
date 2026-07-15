@@ -25,6 +25,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from panoptes.core.errors import ConfigError
+from panoptes.core.events import EventType
 from panoptes.core.types import VehicleClass
 
 __all__ = [
@@ -329,10 +330,28 @@ class GovernorConfig(BaseModel):
 class SnapshotConfig(BaseModel):
     enabled: bool = True
     on_events: list[str] = Field(
-        default_factory=lambda: ["watchlist_hit", "speeding", "wrong_way", "rule_triggered"]
+        default_factory=lambda: [
+            "watchlist_hit",
+            "speeding",
+            "wrong_way",
+            "stopped_vehicle",
+            "rule_triggered",
+        ]
     )
     annotate: bool = True
     max_per_minute: int = 60
+
+    @field_validator("on_events")
+    @classmethod
+    def _known_events(cls, v: list[str]) -> list[str]:
+        # Snapshots match on ``event.type.value``; a typo here silently
+        # disables capture for that event, so fail fast at startup.
+        allowed = {e.value for e in EventType}
+        for name in v:
+            if name not in allowed:
+                expected = ", ".join(sorted(allowed))
+                raise ValueError(f"unknown snapshot event '{name}'; expected one of: {expected}")
+        return v
 
 
 class StreamConfig(BaseModel):
@@ -458,12 +477,21 @@ class AppConfig(BaseSettings):
                 if t not in stream_ids:
                     raise ConfigError(f"rule '{rule.id}' references unknown stream '{t}'")
             ref = getattr(cond, "line", None) or getattr(cond, "zone", None)
-            if ref is not None and rule.streams is not None:
-                for t in rule.streams:
-                    if ref not in geometry.get(t, set()):
-                        raise ConfigError(
-                            f"rule '{rule.id}': stream '{t}' has no line/zone '{ref}'"
-                        )
+            if ref is not None:
+                if rule.streams is not None:
+                    for t in rule.streams:
+                        if ref not in geometry.get(t, set()):
+                            raise ConfigError(
+                                f"rule '{rule.id}': stream '{t}' has no line/zone '{ref}'"
+                            )
+                # Unscoped (``streams: null``) rules run on every stream that
+                # carries the referenced geometry; a ref that exists nowhere
+                # can never fire, so treat it as a configuration error rather
+                # than a silent no-op (mirrors the watchlist check below).
+                elif ref not in set().union(*geometry.values()):
+                    raise ConfigError(
+                        f"rule '{rule.id}' references unknown line/zone '{ref}'"
+                    )
             wl = getattr(cond, "watchlist", None)
             if wl is not None and wl not in watchlist_ids:
                 raise ConfigError(f"rule '{rule.id}' references unknown watchlist '{wl}'")
