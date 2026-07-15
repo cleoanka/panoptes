@@ -243,6 +243,7 @@ class TestAlprPipeline:
         assert plate_read.data == {
             "plate": "34ABC123",
             "confidence": 1.0,  # unanimous reads -> full weight share
+            "valid": True,  # the validation outcome must ride on the event, not just Track.plate
             "corrected": False,
             "country": "TR",
         }
@@ -292,6 +293,11 @@ class TestAlprPipeline:
         assert len(events) == 1
         assert events[0].data["plate"] == "99ZZZZZZ"
         assert events[0].data["country"] is None
+        # The validation outcome must ride on the event (storage + the
+        # plate-validity metric read event.data["valid"]) and must agree with
+        # Track.plate — with country=None nothing is rejected, so both are True.
+        assert "valid" in events[0].data
+        assert events[0].data["valid"] == track.plate.valid is True
 
     def test_low_ocr_confidence_discarded(self, fake_alpr: _FakeBackend) -> None:
         fake_alpr.plates = [(200, 300, 280, 330, 0.9)]

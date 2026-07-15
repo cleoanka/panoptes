@@ -492,6 +492,29 @@ def test_snapshot_saver_disabled(tmp_path: Path):
     assert saver.maybe_save(_event(EventType.WATCHLIST_HIT), frame, []) is None
 
 
+def test_snapshot_write_error_degrades_not_crashes(tmp_path: Path):
+    # media_dir is a regular FILE, so mkdir(parents=True) under it raises OSError
+    # (disk-full / permission / read-only FS behave the same). A snapshot write
+    # failure must return None, never propagate and tear down the stream.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_bytes(b"x")
+    saver = SnapshotSaver(SnapshotConfig(), blocker)
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    assert saver.maybe_save(_event(EventType.WATCHLIST_HIT), frame, []) is None
+
+
+def test_snapshot_bad_wall_ts_degrades_not_crashes(tmp_path: Path):
+    # An out-of-range wall_ts (defensive: today it's always time.time()) makes
+    # datetime.fromtimestamp raise OverflowError — one malformed event must not
+    # be fatal to the whole stream.
+    saver = SnapshotSaver(SnapshotConfig(), tmp_path)
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    bad = Event(
+        type=EventType.WATCHLIST_HIT, stream_id="s1", timestamp=1.0, wall_ts=1e20, data={}
+    )
+    assert saver.maybe_save(bad, frame, []) is None
+
+
 # ---------------------------------------------------------------------
 # sources
 # ---------------------------------------------------------------------

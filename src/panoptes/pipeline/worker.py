@@ -212,7 +212,7 @@ class StreamProcessor:
             if event.type is EventType.PLATE_READ:
                 metric_handle("panoptes_plate_reads_total").labels(
                     stream=event.stream_id,
-                    valid=str(bool(event.data.get("valid", True))).lower(),
+                    valid=str(bool(event.data.get("valid", False))).lower(),
                 ).inc()
             self._bus.publish(event)
 

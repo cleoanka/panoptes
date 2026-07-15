@@ -198,6 +198,7 @@ class AlprPipeline:
                 data={
                     "plate": final.text,
                     "confidence": round(consensus.confidence, 3),
+                    "valid": final.valid,
                     "corrected": corrected,
                     "country": final.country,
                 },
