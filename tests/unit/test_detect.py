@@ -82,6 +82,41 @@ class TestRegistry:
         with pytest.raises(BackendUnavailableError, match="cuda-python"):
             create_detector(DetectorConfig(backend="tensorrt", model="model.engine"))
 
+    def _install_fake_tensorrt_runtime(self, monkeypatch, recorder: dict) -> None:
+        """Fake ``tensorrt`` + ``cuda.bindings.runtime`` reaching just past the
+        ``cudaSetDevice`` call (the engine-file check then aborts __init__)."""
+        monkeypatch.setitem(sys.modules, "tensorrt", types.ModuleType("tensorrt"))
+        cuda = types.ModuleType("cuda")
+        bindings = types.ModuleType("cuda.bindings")
+        runtime = types.ModuleType("cuda.bindings.runtime")
+
+        def cudaSetDevice(device_id):
+            recorder["set_device"] = device_id
+            return (0,)
+
+        runtime.cudaSetDevice = cudaSetDevice
+        cuda.bindings = bindings  # type: ignore[attr-defined]
+        bindings.runtime = runtime  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "cuda", cuda)
+        monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
+        monkeypatch.setitem(sys.modules, "cuda.bindings.runtime", runtime)
+
+    def test_tensorrt_cuda_device_selected(self, monkeypatch):
+        recorder: dict = {}
+        self._install_fake_tensorrt_runtime(monkeypatch, recorder)
+        # cudaSetDevice runs before the engine-file check, so a missing file
+        # still exercises the device-selection path.
+        with pytest.raises(ConfigError, match="not found"):
+            create_detector(DetectorConfig(backend="tensorrt", model="absent.engine", device="cuda:1"))
+        assert recorder["set_device"] == 1
+
+    def test_tensorrt_auto_device_not_selected(self, monkeypatch):
+        recorder: dict = {}
+        self._install_fake_tensorrt_runtime(monkeypatch, recorder)
+        with pytest.raises(ConfigError, match="not found"):
+            create_detector(DetectorConfig(backend="tensorrt", model="absent.engine", device="auto"))
+        assert "set_device" not in recorder
+
 
 # ---------------------------------------------------------------------
 # mock backend
@@ -625,6 +660,33 @@ class TestRFDetrBackend:
         results = detector.infer([make_frame(), make_frame(), make_frame()])
         assert len(results) == 3
         assert len(recorder["images"]) == 3
+
+    def test_auto_device_not_passed_to_constructor(self, monkeypatch):
+        recorder: dict = {}
+        install_fake_rfdetr(monkeypatch, recorder)
+        create_detector(DetectorConfig(backend="rfdetr", model="rfdetr-medium"))
+        assert "device" not in recorder["init_kwargs"]
+
+    def test_explicit_device_passed_to_constructor(self, monkeypatch):
+        recorder: dict = {}
+        install_fake_rfdetr(monkeypatch, recorder)
+        create_detector(
+            DetectorConfig(backend="rfdetr", model="rfdetr-medium", device="cuda:0")
+        )
+        assert recorder["init_kwargs"]["device"] == "cuda:0"
+
+    def test_explicit_rfdetr_kwargs_device_wins(self, monkeypatch):
+        recorder: dict = {}
+        install_fake_rfdetr(monkeypatch, recorder)
+        create_detector(
+            DetectorConfig(
+                backend="rfdetr",
+                model="rfdetr-medium",
+                device="cuda:0",
+                extra={"rfdetr_kwargs": {"device": "cpu"}},
+            )
+        )
+        assert recorder["init_kwargs"]["device"] == "cpu"
 
     @pytest.mark.parametrize("model", ["rfdetr-xl", "rfdetr-2xl", "RFDETR_XL"])
     def test_pml_licensed_tiers_rejected(self, model):

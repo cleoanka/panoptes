@@ -66,7 +66,7 @@ class DetectorConfig(BaseModel):
     imgsz: int = 640
     conf: float = 0.25
     iou: float = 0.5  # ignored by end-to-end (NMS-free) models such as YOLO26
-    half: bool = True
+    half: bool = True  # FP16 hint; onnx/tensorrt bake precision into the artifact at export
     classes: list[VehicleClass] | None = None  # canonical class filter; None = all vehicles
     max_batch: int = 8
     extra: dict[str, Any] = Field(default_factory=dict)  # backend-specific knobs

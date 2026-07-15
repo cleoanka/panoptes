@@ -55,6 +55,14 @@ class TensorRTDetector(Detector):
         except ImportError as exc:
             raise BackendUnavailableError("tensorrt", _HINT) from exc
         self._cudart = _import_cudart()
+        # Bind this backend to a specific GPU before any stream/buffer
+        # allocation so they land on the requested device. "auto"/"cpu"
+        # leave the CUDA default (device 0); "mps" is meaningless here.
+        # config.half (FP16) is not honoured at load time: engine precision
+        # is baked in at export (panoptes export --format engine --half).
+        if config.device.startswith("cuda"):
+            device_id = int(config.device.split(":", 1)[1]) if ":" in config.device else 0
+            self._check(self._cudart.cudaSetDevice(device_id))
         engine_path = Path(config.model)
         if not engine_path.exists():
             raise ConfigError(f"tensorrt engine file not found: {engine_path}")
