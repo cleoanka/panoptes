@@ -73,17 +73,19 @@ def _greedy_match(
     track_boxes = np.array([e.predicted.to_xyxy() for e in entries], dtype=np.float64)
     det_boxes = np.array([d.bbox.to_xyxy() for d in detections], dtype=np.float64)
     iou = bbox_ious(track_boxes, det_boxes)
-    candidates = [
-        (float(iou[i, j]), i, j)
-        for i in range(len(entries))
-        for j in range(len(detections))
-        if iou[i, j] >= min_iou
-    ]
-    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    # Threshold in numpy, then order the survivors by descending IoU. A
+    # *stable* argsort keeps np.nonzero's row-major (i, j) order intact,
+    # reproducing the old ``(-iou, i, j)`` tie-break bit-for-bit while
+    # skipping the sub-threshold majority and per-cell float() calls. The
+    # float64 cast matches the old float() promotion of the float32 matrix.
+    ii, jj = np.nonzero(iou >= min_iou)
+    order = np.argsort(-iou[ii, jj].astype(np.float64), kind="stable")
     taken_tracks: set[int] = set()
     taken_dets: set[int] = set()
     pairs: list[tuple[_Entry, Detection]] = []
-    for _iou, i, j in candidates:
+    for k in order:
+        i = int(ii[k])
+        j = int(jj[k])
         if i in taken_tracks or j in taken_dets:
             continue
         taken_tracks.add(i)
