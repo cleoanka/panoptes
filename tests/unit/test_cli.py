@@ -297,6 +297,33 @@ def test_benchmark_rejects_unknown_backend() -> None:
     assert result.exit_code == 2
 
 
+def test_benchmark_backend_literal_matches_model() -> None:
+    # The benchmark cast target (cli.DetectorBackend) must mirror DetectorConfig
+    # — the single source of truth for valid backends. Locking them here means a
+    # backend added to the model but forgotten in the CLI literal fails this test
+    # instead of silently narrowing away at the cast.
+    from typing import get_args
+
+    from panoptes.cli import DetectorBackend
+    from panoptes.core.config import DetectorConfig
+
+    model_backends = set(get_args(DetectorConfig.model_fields["backend"].annotation))
+    assert model_backends, "DetectorConfig must declare at least one backend"
+    assert set(get_args(DetectorBackend)) == model_backends
+
+
+def test_benchmark_accepts_every_model_backend() -> None:
+    # Every backend the model declares must clear the guard (it may still fail
+    # later on an absent runtime, but never with an 'unknown backend' rejection).
+    from typing import get_args
+
+    from panoptes.core.config import DetectorConfig
+
+    for backend in get_args(DetectorConfig.model_fields["backend"].annotation):
+        result = runner.invoke(app, ["benchmark", "--backend", backend, "--frames", "1"])
+        assert f"unknown backend '{backend}'" not in _combined_output(result)
+
+
 # ---------------------------------------------------------------------
 # calibrate check
 # ---------------------------------------------------------------------

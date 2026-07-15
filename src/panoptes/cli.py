@@ -47,6 +47,17 @@ from panoptes.core.errors import (
 from panoptes.core.events import Event, EventBus, EventType
 from panoptes.observability import setup_logging
 
+# Static mirror of the DetectorConfig ``backend`` field, needed because the
+# pydantic-mypy plugin type-checks that constructor argument as the field's
+# Literal (a plain ``str`` is rejected). mypy cannot read the type off the
+# model at analysis time, so the literal is written here once and the runtime
+# assertion below fails loudly if it ever falls out of sync with the model —
+# the model stays the single source of truth.
+DetectorBackend = Literal["ultralytics", "rfdetr", "onnx", "tensorrt", "mock"]
+assert set(get_args(DetectorBackend)) == set(
+    get_args(DetectorConfig.model_fields["backend"].annotation)
+), "cli.DetectorBackend has drifted from DetectorConfig.backend"
+
 app = typer.Typer(
     name="panoptes",
     help="Road & vehicle intelligence platform.",
@@ -565,17 +576,18 @@ def benchmark(
 ) -> None:
     """Measure detector throughput and latency on synthetic frames."""
     # ``backend`` arrives as a free-form str from Typer; narrow it to the
-    # DetectorConfig backend literal (kept in sync with the model field) so a
-    # bad value fails fast with a clear message instead of a pydantic dump.
-    valid_backends = get_args(DetectorConfig.model_fields["backend"].annotation)
+    # DetectorConfig backend literal so a bad value fails fast with a clear
+    # message instead of a pydantic dump. ``DetectorBackend`` mirrors the model
+    # field and drives *both* the runtime guard (via ``get_args``) and the cast,
+    # so the two can never disagree; ``_assert_backend_alias_in_sync`` locks the
+    # alias to the model itself so a new backend can't drift out silently.
+    valid_backends = get_args(DetectorBackend)
     if backend not in valid_backends:
         _fail(
             f"unknown backend '{backend}' (choose {', '.join(valid_backends)})",
             code=2,
         )
-    backend_literal = cast(
-        'Literal["ultralytics", "rfdetr", "onnx", "tensorrt", "mock"]', backend
-    )
+    backend_literal = cast(DetectorBackend, backend)
     try:
         det_cfg = DetectorConfig(
             backend=backend_literal, model=model, imgsz=imgsz, max_batch=batch
