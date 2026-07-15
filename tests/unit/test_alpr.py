@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from panoptes.alpr import AlprPipeline
+from panoptes.alpr.validate import _coerce, correct_and_validate, normalize, validate
 from panoptes.alpr.voting import PlateVoter
 from panoptes.core.config import AlprConfig, PrivacyConfig, WatchlistConfig
 from panoptes.core.errors import BackendUnavailableError
@@ -172,6 +173,125 @@ class TestPlateVoter:
         voter = PlateVoter(vote_min_reads=2)
         voter.add_read(1, "34ABC123", 0.9)
         assert voter.add_read(2, "34ABC123", 0.9) is None  # track 2 has 1 read
+
+
+# --------------------------------------------------------------------
+# correct_and_validate — structure-aware OCR correction
+#
+# These pin the digit<->letter coercion directly: it can synthesise a
+# plate string no OCR read produced, so every mapping and every guard
+# against over-correction is nailed down here rather than only through
+# the pipeline.
+# --------------------------------------------------------------------
+class TestCorrectAndValidate:
+    def test_valid_plates_pass_unchanged(self) -> None:
+        # Every legal (n_letters, n_digits) shape validates as-is, no coercion.
+        for plate in ("34 ABC 123", "06 B 1234", "01A1234", "34YZ999", "35FGH42"):
+            r = correct_and_validate(plate)
+            assert r.valid is True
+            assert r.country == "TR"
+            assert r.corrected is False
+            assert r.text == normalize(plate)  # spaces stripped, nothing coerced
+
+    def test_invalid_province_rejected_not_coerced(self) -> None:
+        # 82..99 and 00 are out of the 01-81 range; the leading digits are
+        # already digits so there is nothing to coerce them into -> invalid.
+        for plate in ("99ZZZZ", "82ABC123", "00ABC123", "90A1234"):
+            r = correct_and_validate(plate)
+            assert r.valid is False
+            assert r.country is None
+            assert r.corrected is False
+            assert r.text == normalize(plate)  # returned verbatim, not faked
+
+    def test_digit_to_letter_coercions_in_letter_slot(self) -> None:
+        # A digit landing in a letter position is mapped to its look-alike
+        # letter: 8->B (safe), and the aggressive 4->A / 7->T.
+        assert correct_and_validate("34 A8C 123").text == "34ABC123"
+        assert correct_and_validate("341BC123").text == "34IBC123"  # 1->I
+        assert correct_and_validate("340BC123").text == "34OBC123"  # 0->O
+        for src in ("34A8C123", "341BC123", "340BC123"):
+            assert correct_and_validate(src).corrected is True
+
+    def test_letter_to_digit_coercions_in_digit_slot(self) -> None:
+        # A letter landing in a digit position is mapped to its look-alike
+        # digit; O->0, I->1, S->5, Z->2, G->6 are the safe set.
+        assert correct_and_validate("34ABCI23").text == "34ABC123"  # I->1
+        assert correct_and_validate("34ABCO23").text == "34ABC023"  # O->0
+        assert correct_and_validate("34ABCS23").text == "34ABC523"  # S->5
+        for src in ("34ABCI23", "34ABCO23", "34ABCS23"):
+            assert correct_and_validate(src).corrected is True
+
+    def test_province_coercion_uses_digit_slot(self) -> None:
+        # Positions 0-1 are digit slots too: O->0 fixes an OCR'd province.
+        r = correct_and_validate("3O ABC 123")
+        assert r.text == "30ABC123"
+        assert r.valid is True and r.corrected is True
+        # B->8 would make province 84 (>81) -> unfixable, left verbatim.
+        bad = correct_and_validate("B4ABC123")
+        assert bad.valid is False and bad.corrected is False
+        assert bad.text == "B4ABC123"
+
+    def test_aggressive_only_mappings(self) -> None:
+        # D->0, L->1, T->7, A->4 live only in the aggressive tables and are
+        # applied only after the safe pass fails to reach a legal plate.
+        assert correct_and_validate("3DABC123").text == "30ABC123"  # D->0 province
+        assert correct_and_validate("34ABCL23").text == "34ABC123"  # L->1 digit
+        assert correct_and_validate("34ABCT23").text == "34ABC723"  # T->7 digit
+        assert correct_and_validate("34ABCA23").text == "34ABC423"  # A->4 digit
+
+    def test_real_letters_kept_over_digit_lookalike(self) -> None:
+        # I, O, T, Z are legal TR letters: in a letter slot they stay put and
+        # count as no correction, not silently swapped to a digit.
+        for plate in ("34IBC123", "34OBC123", "34TBC123", "34ZBC123"):
+            r = correct_and_validate(plate)
+            assert r.valid is True
+            assert r.corrected is False
+            assert r.text == plate
+
+    def test_not_over_corrected_when_too_far_from_a_plate(self) -> None:
+        # A string with un-mappable glyphs (or a digit in a letter slot that
+        # has no look-alike letter) must NOT be forced into a fake plate.
+        for garbage in ("HELLO", "WXWXWX", "ABCDEFGHIJ", "1234567890", "34990123"):
+            r = correct_and_validate(garbage)
+            assert r.valid is False
+            assert r.country is None
+            assert r.corrected is False
+            assert r.text == normalize(garbage)  # untouched, no synthesised plate
+
+    def test_length_bounds_short_circuit(self) -> None:
+        # Below 5 or above 10 chars there is no legal TR shape to coerce into.
+        for plate in ("34AB", "3", "34ABC123456"):
+            r = correct_and_validate(plate)
+            assert r.valid is False and r.corrected is False
+
+    def test_non_tr_country_validates_as_is(self) -> None:
+        # Only TR gets structure-aware correction; other countries just
+        # validate against the permissive generic pattern, never coerced.
+        r = correct_and_validate("A8C1234", country="DE")
+        assert r.corrected is False
+        assert r.valid is True and r.country == "DE"
+        assert r.text == "A8C1234"  # 8 left as-is, no TR coercion
+        none = correct_and_validate("ABC1234", country=None)
+        assert none.valid is True and none.country is None and none.corrected is False
+
+    def test_coerce_structural_rules_directly(self) -> None:
+        # _coerce forces [2 digits][n letters][rest digits]; a slot it cannot
+        # satisfy returns None rather than an out-of-shape string.
+        assert _coerce("34IBC123", 3, aggressive=False) == "34IBC123"
+        assert _coerce("341BC123", 3, aggressive=True) == "34IBC123"  # 1->I
+        assert _coerce("34ABC123", 3, aggressive=False) == "34ABC123"
+        assert _coerce("34990123", 1, aggressive=True) is None  # 9 not letter-able
+        assert _coerce("34ABCA23", 3, aggressive=False) is None  # A not in safe digit map
+        assert _coerce("34ABCA23", 3, aggressive=True) == "34ABC423"  # A->4 aggressive
+
+    def test_validate_helper_matches_tr_shapes(self) -> None:
+        # The plain validator agrees with correct_and_validate's "no coercion"
+        # verdict and never mutates the input.
+        assert validate("34ABC123") is True
+        assert validate("34 ABC 123") is True  # normalised before matching
+        assert validate("99ABC123") is False
+        assert validate("34A8C123") is False  # validate does not correct
+        assert validate("34A8C123", country=None) is True  # generic pattern
 
 
 # --------------------------------------------------------------------
