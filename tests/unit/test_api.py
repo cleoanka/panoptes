@@ -84,6 +84,16 @@ class FakePlatesRepo:
         return self.rows
 
 
+class FakeTracksRepo:
+    def __init__(self) -> None:
+        self.rows: list[dict[str, Any]] = []
+        self.last_kwargs: dict[str, Any] | None = None
+
+    async def query(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self.last_kwargs = kwargs
+        return self.rows
+
+
 class FakeDatabase:
     last: FakeDatabase | None = None  # handle for tests on instances created in lifespan
 
@@ -97,7 +107,7 @@ class FakeDatabase:
         self.retention_runs = 0
         self.events = FakeEventsRepo()
         self.plates = FakePlatesRepo()
-        self.tracks = object()
+        self.tracks = FakeTracksRepo()
 
     async def connect(self) -> None:
         self.connected = True
@@ -759,6 +769,72 @@ async def test_plates_search(app_client) -> None:
     (row,) = resp.json()
     assert row["plate"] == "34ABC123"
     assert row["valid"] is True
+
+
+# ------------------------------------------------------------------
+# Tracks: summary history
+# ------------------------------------------------------------------
+async def test_tracks_empty_list(app_client) -> None:
+    client, _app = app_client
+    resp = await client.get("/api/v1/tracks", headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_tracks_query_params_forwarded(app_client) -> None:
+    client, app = app_client
+    repo = app.state.panoptes.db.tracks
+    repo.rows = [
+        {
+            "stream_id": "cam1",
+            "track_id": 7,
+            "vehicle_class": "car",
+            "first_wall_ts": 1.0,
+            "last_wall_ts": 2.0,
+            "duration_s": 1.0,
+            "distance_m": 12.5,
+            "avg_speed_kmh": 45.0,
+            "max_speed_kmh": 60.0,
+            "plate_text": "34ABC123",
+            "plate_confidence": 0.93,
+        }
+    ]
+    resp = await client.get(
+        "/api/v1/tracks",
+        params={
+            "stream": "cam1",
+            "class": "car",
+            "plate": "34ABC123",
+            "since": 1.0,
+            "limit": 5,
+            "offset": 3,
+        },
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert repo.last_kwargs == {
+        "stream": "cam1",
+        "vehicle_class": "car",
+        "plate": "34ABC123",
+        "since": 1.0,
+        "limit": 5,
+        "offset": 3,
+    }
+    (row,) = resp.json()
+    assert row["track_id"] == 7
+    assert row["avg_speed_kmh"] == 45.0
+
+
+async def test_tracks_invalid_class_filter(app_client) -> None:
+    client, _app = app_client
+    assert (
+        await client.get("/api/v1/tracks", params={"class": "spaceship"}, headers=AUTH)
+    ).status_code == 422
+
+
+async def test_tracks_requires_auth(app_client) -> None:
+    client, _app = app_client
+    assert (await client.get("/api/v1/tracks")).status_code == 401
 
 
 # ------------------------------------------------------------------
