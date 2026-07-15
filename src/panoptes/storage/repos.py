@@ -121,11 +121,13 @@ class PlateRepo:
         stream: str | None = None,
         since: float | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Plate-read search, newest first. In hashed mode ``q`` must be a
         full plate (watchlist-style exact match on the hash); in plain mode
-        it is a normalized substring match."""
-        limit, _ = _clamp(limit)
+        it is a normalized substring match. ``offset`` pages past the first
+        ``offset`` rows of the (stable, id-tiebroken) ordering."""
+        limit, offset = _clamp(limit, offset)
         stmt = select(PlateReadRow).order_by(PlateReadRow.wall_ts.desc(), PlateReadRow.id.desc())
         if q:
             if self._hash is not None:
@@ -138,7 +140,7 @@ class PlateRepo:
             stmt = stmt.where(PlateReadRow.stream_id == stream)
         if since is not None:
             stmt = stmt.where(PlateReadRow.wall_ts >= since)
-        stmt = stmt.limit(limit)
+        stmt = stmt.limit(limit).offset(offset)
         async with self._sessions() as session:
             result = await session.execute(stmt)
             return [row.to_dict() for row in result.scalars()]

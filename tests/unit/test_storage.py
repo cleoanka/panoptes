@@ -485,3 +485,15 @@ async def test_disconnect_flushes_pending_and_detaches() -> None:
     )
     with db._buffer_lock:
         assert db._buffer == []
+
+
+def test_plate_data_keys_single_source_of_truth() -> None:
+    # The at-rest hasher (storage.db) and the live-feed redactor (api.redact)
+    # must scrub the SAME plate-bearing keys; a divergence would leak plates in
+    # one path but not the other. Both must reference the one core constant.
+    import panoptes.api.redact as redact
+    import panoptes.storage.db as dbmod
+    from panoptes.core.types import PLATE_DATA_KEYS
+
+    assert dbmod._PLATE_DATA_KEYS is PLATE_DATA_KEYS
+    assert redact.PLATE_DATA_KEYS is PLATE_DATA_KEYS

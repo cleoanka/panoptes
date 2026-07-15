@@ -765,10 +765,27 @@ async def test_plates_search(app_client) -> None:
         "/api/v1/plates", params={"q": "34ABC", "stream": "cam1", "limit": 10}, headers=AUTH
     )
     assert resp.status_code == 200
-    assert repo.last_kwargs == {"q": "34ABC", "stream": "cam1", "since": None, "limit": 10}
+    assert repo.last_kwargs == {
+        "q": "34ABC", "stream": "cam1", "since": None, "limit": 10, "offset": 0,
+    }
     (row,) = resp.json()
     assert row["plate"] == "34ABC123"
     assert row["valid"] is True
+
+
+async def test_plates_search_pagination_offset_forwarded(app_client) -> None:
+    client, app = app_client
+    repo = app.state.panoptes.db.plates
+    repo.rows = []
+    resp = await client.get(
+        "/api/v1/plates", params={"limit": 50, "offset": 100}, headers=AUTH
+    )
+    assert resp.status_code == 200
+    assert repo.last_kwargs["limit"] == 50
+    assert repo.last_kwargs["offset"] == 100
+    # Negative offset is rejected by the route (ge=0), never reaching the repo.
+    bad = await client.get("/api/v1/plates", params={"offset": -1}, headers=AUTH)
+    assert bad.status_code == 422
 
 
 # ------------------------------------------------------------------

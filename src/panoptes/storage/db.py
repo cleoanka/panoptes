@@ -38,6 +38,7 @@ from panoptes.alpr.validate import normalize
 from panoptes.core.config import DatabaseConfig, PrivacyConfig
 from panoptes.core.errors import BackendUnavailableError
 from panoptes.core.events import Event, EventBus, EventType
+from panoptes.core.types import PLATE_DATA_KEYS
 from panoptes.storage.models import Base, EventRow, PlateReadRow, TrackRow
 from panoptes.storage.repos import EventRepo, PlateRepo, TrackRepo
 
@@ -47,8 +48,10 @@ logger = logging.getLogger(__name__)
 
 # event.data keys treated as plate-bearing when hashing is configured.
 # Over-matching ("text") is deliberate: hashing a non-plate string is
-# harmless, persisting a raw plate is a compliance breach.
-_PLATE_DATA_KEYS = frozenset({"plate", "plate_text", "text", "raw_text", "matched_plate"})
+# harmless, persisting a raw plate is a compliance breach. Shared with the
+# live-feed redactor (api.redact) via a single source of truth so the two
+# scrub paths can never silently diverge.
+_PLATE_DATA_KEYS = PLATE_DATA_KEYS
 
 # After this many consecutive failures of the same head batch (i.e. on the
 # 3rd attempt) flush() falls back to per-event inserts so one poison event
