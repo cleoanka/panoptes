@@ -146,10 +146,11 @@ class LineSegment:
         """Return +1 / -1 for a crossing (sign = direction), 0 for none.
 
         +1 means movement from the negative half-plane to the positive one.
-        Half-open convention: a point exactly ON the line (side == 0)
-        belongs to the half-plane it is *leaving from*, so a trajectory
-        that touches the line for one frame (neg -> 0 -> pos) counts
-        exactly once, never twice.
+        Half-open convention: a point exactly ON the line (``side == 0``)
+        is grouped with the *positive* half-plane, so a trajectory that
+        touches the line for one frame (neg -> 0 -> pos) is counted on the
+        ``neg -> 0`` step and never again on ``0 -> pos`` — exactly once,
+        never twice.
         """
         s1 = self.side(*p1)
         s2 = self.side(*p2)
