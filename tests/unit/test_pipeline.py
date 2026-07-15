@@ -47,7 +47,7 @@ from panoptes.core.types import (
 from panoptes.pipeline import PipelineManager
 from panoptes.pipeline.annotate import annotate
 from panoptes.pipeline.governor import FrameGovernor
-from panoptes.pipeline.scheduler import InferenceScheduler
+from panoptes.pipeline.scheduler import _SENTINEL, InferenceScheduler
 from panoptes.pipeline.snapshots import SnapshotSaver
 from panoptes.pipeline.source import OpenCvSource, PyAvSource, open_source
 
@@ -412,6 +412,45 @@ def test_scheduler_close_drains_and_rejects_new_work():
         future.result()  # drained batches resolve normally
     with pytest.raises(RuntimeError):
         scheduler.infer(_marked_frame(0))
+
+
+def test_scheduler_submit_racing_close_never_orphans_future():
+    """A submit that reaches put() as close() runs must not leave a future
+    pending (which would hang the worker on .result() forever)."""
+
+    class SlowDetector:
+        def infer(self, frames):
+            time.sleep(0.01)
+            return [[] for _ in frames]
+
+    scheduler = InferenceScheduler(SlowDetector(), max_batch=4, max_delay_ms=5)
+    real_put = scheduler._queue.put
+    closing = threading.Thread(target=scheduler.close)
+    triggered = threading.Event()
+
+    def racing_put(item, *args, **kwargs):
+        # Only meddle with real submissions (frame, future), not the sentinel.
+        if not triggered.is_set() and item is not _SENTINEL:
+            triggered.set()
+            # Start close() concurrently the instant this submit is enqueuing,
+            # then give it time to flip _closed, join and drain. Without locking
+            # the check+put, this put lands behind a fully drained queue.
+            closing.start()
+            time.sleep(0.05)
+        return real_put(item, *args, **kwargs)
+
+    scheduler._queue.put = racing_put  # type: ignore[method-assign]
+    future = scheduler.submit(_marked_frame(1))
+    wait_for(triggered.is_set, message="racing submit reached put")
+    closing.join(5.0)
+    assert not closing.is_alive()
+    assert not scheduler._thread.is_alive()
+    # The future is settled one way or another (drained normally or failed) —
+    # never orphaned, which is the only outcome that would hang the worker.
+    assert future.done()
+    assert future.exception(timeout=0) is None or isinstance(
+        future.exception(timeout=0), RuntimeError
+    )
 
 
 # ---------------------------------------------------------------------

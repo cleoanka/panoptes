@@ -115,10 +115,16 @@ class InferenceScheduler:
     # -- worker-facing API ---------------------------------------------
     def submit(self, frame: np.ndarray) -> Future[list[Detection]]:
         """Enqueue one frame; the future resolves to its detections."""
-        if self._closed:
-            raise RuntimeError("InferenceScheduler is closed")
         future: Future[list[Detection]] = Future()
-        self._queue.put((frame, future))
+        # Hold _close_lock across the closed-check + enqueue so a submission
+        # cannot slip onto the queue after close() has already drained it
+        # (which would orphan the future and hang the worker forever). The
+        # scheduler thread keeps draining while we hold the lock, so a full
+        # queue still empties and put() cannot deadlock against close().
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("InferenceScheduler is closed")
+            self._queue.put((frame, future))
         return future
 
     def infer(self, frame: np.ndarray) -> list[Detection]:
@@ -131,19 +137,21 @@ class InferenceScheduler:
             if self._closed:
                 return
             self._closed = True
-        self._queue.put(_SENTINEL)
-        self._thread.join(timeout=30.0)
-        # Submissions that raced close() land behind the sentinel: fail them
-        # so no worker is left blocked on an orphan future.
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is _SENTINEL:
-                continue
-            _, future = item
-            future.set_exception(RuntimeError("InferenceScheduler closed"))
+            # Flip _closed, join, and drain all under the lock so no submit()
+            # can enqueue a future in the window after we finish draining.
+            self._queue.put(_SENTINEL)
+            self._thread.join(timeout=30.0)
+            # Submissions that raced close() land behind the sentinel: fail them
+            # so no worker is left blocked on an orphan future.
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is _SENTINEL:
+                    continue
+                _, future = item
+                future.set_exception(RuntimeError("InferenceScheduler closed"))
 
     # -- scheduler thread ------------------------------------------------
     def _run(self) -> None:
