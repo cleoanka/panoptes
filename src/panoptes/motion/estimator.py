@@ -55,6 +55,13 @@ _SPEEDING_REEMIT_S = 30.0
 # seconds), mirroring the SPEEDING throttle.
 _STOPPED_REEMIT_S = 30.0
 
+# Minimum reference baseline as a fraction of window_s. When a track is
+# re-acquired all in-window points cluster near the newest frame, so even
+# the earliest one gives a sub-window dt that would amplify bbox jitter into
+# a large raw km/h and seed the EMA from it. Below this the estimate is
+# deferred until a full-baseline reference exists.
+_MIN_REFERENCE_DT_FRACTION = 0.3
+
 # Track.data key holding the timestamp of the first dip below the stopped
 # threshold in the current stationary spell (cleared when speed rises).
 _STOPPED_SINCE_KEY = "_stopped_since_ts"
@@ -153,25 +160,32 @@ class MotionEstimator:
         if track.age_seconds < self._speed.min_track_s:
             return
         window_start = current.timestamp - self._speed.window_s
-        grounded = [
-            (p.timestamp, p.ground[0], p.ground[1])
-            for p in track.points
-            if p.ground is not None
-        ]
+        # Walk the (append-only, time-ordered) trail backwards from the
+        # point before ``current``, keeping the earliest point still inside
+        # the window. That earliest in-window point is the reference: it is
+        # the one closest to ``window_start`` and so maximises the baseline,
+        # and staying inside the window keeps a track re-acquired after a
+        # long occlusion from reporting a speed computed across the gap.
+        # Only the last ~window_s of trail can qualify, so the walk stops at
+        # the first out-of-window point instead of scanning full history.
+        ref: tuple[float, float, float] | None = None
+        for point in reversed(track.points[:-1]):
+            if point.ground is None:
+                continue
+            if point.timestamp < window_start:
+                break
+            ref = (point.timestamp, point.ground[0], point.ground[1])
         # A reference must exist *inside* the window (the current point is
-        # already in-window, so one prior in-window point makes two): a
-        # track re-acquired after a long occlusion must not report a speed
-        # computed across the gap.
-        in_window = [g for g in grounded[:-1] if g[0] >= window_start]
-        if not in_window:
+        # already in-window, so one prior in-window point makes two).
+        if ref is None:
             return
-        # Take the reference from inside the window only. The globally
-        # closest point to ``window_start`` could be a pre-gap point just
-        # before the boundary, silently spanning the occlusion — exactly
-        # what the in-window requirement above exists to prevent.
-        ref_ts, ref_x, ref_y = min(in_window, key=lambda g: abs(g[0] - window_start))
+        ref_ts, ref_x, ref_y = ref
         dt = current.timestamp - ref_ts
-        if dt <= _MIN_DT_S:
+        # A sub-window baseline means every in-window point clusters near
+        # ``current`` (typically a just-re-acquired track): raw_kmh would
+        # divide bbox jitter by a tiny dt and seed the EMA from that spike.
+        # Defer until a full-baseline reference exists.
+        if dt <= _MIN_DT_S or dt < _MIN_REFERENCE_DT_FRACTION * self._speed.window_s:
             return
         dx = current.ground[0] - ref_x
         dy = current.ground[1] - ref_y

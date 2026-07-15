@@ -142,6 +142,23 @@ def test_reference_never_taken_from_before_the_window() -> None:
     assert track.speed_kmh == pytest.approx(0.72, rel=1e-3)
 
 
+def test_short_baseline_reference_does_not_seed_ema_from_jitter() -> None:
+    # A parked car re-acquired after a long occlusion: an old first point
+    # makes the track pass min_track_s, then only two fresh points sit inside
+    # the 1 s window, clustered near the newest frame with +-1 px bbox jitter.
+    # The earliest in-window reference then gives a 0.1 s baseline, and the
+    # 2 px jitter over that dt would seed the EMA at a bogus ~7.2 km/h. The
+    # estimate must be deferred until a full-window baseline exists.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    advance(track, 0.0, 100.0, 50.0)  # old point: track is old enough
+    advance(track, 9.9, 99.0, 50.0)   # re-acquired; earliest in-window, trough
+    advance(track, 9.95, 101.0, 50.0)
+    advance(track, 10.0, 101.0, 50.0)  # current, peak; window_start = 9.0
+    estimator.process([track], "cam1", WALL_T0 + 10.0)
+    assert track.speed_kmh is None
+
+
 # ----------------------------------------------------------------------
 # golden: SPEEDING events
 # ----------------------------------------------------------------------
