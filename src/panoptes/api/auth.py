@@ -11,12 +11,16 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from fastapi import HTTPException, Request, WebSocket
 
 if TYPE_CHECKING:
     from panoptes.api.app import AppState
+    from panoptes.api.jobs import JobRegistry
+    from panoptes.core.events import EventBus
+    from panoptes.pipeline.manager import PipelineManager
+    from panoptes.storage.db import Database
 
 __all__ = [
     "api_key_dependency",
@@ -59,6 +63,19 @@ def get_state(conn: Request | WebSocket) -> AppState:
     return conn.app.state.panoptes
 
 
+# Overloads keyed on the attribute name recover each component's real type
+# (AppState types them, but the None-guard below would otherwise erase them
+# to Any); the ``str`` fallback keeps dynamic callers working.
+@overload
+def require_component(state: AppState, attr: Literal["jobs"]) -> JobRegistry: ...
+@overload
+def require_component(state: AppState, attr: Literal["bus"]) -> EventBus: ...
+@overload
+def require_component(state: AppState, attr: Literal["db"]) -> Database: ...
+@overload
+def require_component(state: AppState, attr: Literal["manager"]) -> PipelineManager: ...
+@overload
+def require_component(state: AppState, attr: str) -> Any: ...
 def require_component(state: AppState, attr: str) -> Any:
     """Fetch a lifespan-initialised component or fail with 503.
 

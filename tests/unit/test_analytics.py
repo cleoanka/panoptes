@@ -325,6 +325,46 @@ class TestRulesEngine:
         ev = make_event(EventType.SPEEDING, {"speed_kmh": 70.0})
         assert engine.evaluate([ev], {}, 1.0, 1_000_001.0) == []
 
+    def test_track_finished_evicts_cooldown_state(self) -> None:
+        # A finished track's cooldown entry must not leak forever (track_id
+        # is never reused). The final-frame fire is preserved (eviction runs
+        # after evaluation), but the entry is gone afterwards.
+        rule = RuleConfig(
+            id="r-speed",
+            when={"type": "speed", "min_kmh": 80.0},
+            cooldown_s=10.0,
+        )
+        engine = RulesEngine([rule], [], STREAM_ID, known_geometry_ids=set())
+        track = make_track()
+        track.speed_kmh = 95.0
+
+        speed = make_event(EventType.SPEEDING, {"speed_kmh": 95.0}, timestamp=5.0)
+        finish = make_event(EventType.TRACK_FINISHED, {}, timestamp=5.0)
+        # Track fires and finishes in the same frame: fire is preserved...
+        fired = engine.evaluate([speed, finish], {1: track}, 5.0, 1_000_005.0)
+        assert len(fired) == 1
+        # ...but its cooldown entry is evicted, leaving nothing behind.
+        assert engine._last_fired == {}
+
+    def test_rule_level_cooldown_survives_track_finished(self) -> None:
+        # Rule-level entries (track_id is None) are not per-track state and
+        # must not be evicted when unrelated tracks finish.
+        rule = RuleConfig(
+            id="r-cross",
+            when={"type": "line_cross", "line": "l1", "direction": "any"},
+            cooldown_s=10.0,
+        )
+        engine = RulesEngine([rule], [], STREAM_ID, known_geometry_ids={"l1"})
+        # Trackless LINE_CROSSED fires the rule with a rule-level key.
+        cross = make_event(
+            EventType.LINE_CROSSED,
+            {"line": "l1", "direction_canonical": "forward"},
+            track_id=None,
+        )
+        finish = make_event(EventType.TRACK_FINISHED, {}, track_id=7, timestamp=1.0)
+        assert len(engine.evaluate([cross, finish], {}, 1.0, 1_000_001.0)) == 1
+        assert (rule.id, None) in engine._last_fired
+
     def test_all_of_zone_dwell_and_class(self) -> None:
         rule = RuleConfig(
             id="r-truck-dwell",

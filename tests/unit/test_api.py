@@ -13,13 +13,14 @@ import json
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, assert_type
 
 import anyio
 import cv2
 import httpx
 import numpy as np
 import pytest
+from fastapi import HTTPException
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -27,6 +28,8 @@ import panoptes.observability
 import panoptes.pipeline
 import panoptes.storage
 from panoptes.api import create_app
+from panoptes.api.app import AppState
+from panoptes.api.auth import require_component
 from panoptes.api.jobs import JobRegistry
 from panoptes.api.schemas import scrub_url
 from panoptes.core.config import (
@@ -41,6 +44,11 @@ from panoptes.core.config import (
     WebhookAction,
 )
 from panoptes.core.events import Event, EventType
+
+if TYPE_CHECKING:
+    from panoptes.core.events import EventBus
+    from panoptes.pipeline.manager import PipelineManager
+    from panoptes.storage.db import Database
 
 API_KEY = "test-key-123"
 AUTH = {"X-API-Key": API_KEY}
@@ -863,6 +871,38 @@ async def test_job_registry_never_evicts_running_jobs() -> None:
         gate.set()
     job = await _wait_terminal(reg, slow_id)
     assert job["status"] == "done"
+
+
+# ------------------------------------------------------------------
+# require_component: 503 guard + static type recovery
+# ------------------------------------------------------------------
+def test_require_component_503_before_lifespan(tmp_path: Path) -> None:
+    # bus/db/manager are None until the lifespan runs; the guard must 503,
+    # never AttributeError/500, and name the missing component.
+    state = AppState(config=make_config(tmp_path), jobs=JobRegistry())
+    with pytest.raises(HTTPException) as excinfo:
+        require_component(state, "bus")
+    assert excinfo.value.status_code == 503
+    assert "bus" in excinfo.value.detail
+
+
+def test_require_component_returns_ready_component(tmp_path: Path) -> None:
+    from panoptes.core.events import EventBus
+
+    state = AppState(config=make_config(tmp_path), jobs=JobRegistry())
+    state.bus = EventBus()
+    assert require_component(state, "bus") is state.bus
+    assert require_component(state, "jobs") is state.jobs
+
+
+if TYPE_CHECKING:
+    # Static contract: the overloads recover each component's real type
+    # instead of collapsing to Any (mypy fails here if they regress to Any).
+    def _require_component_types(state: AppState) -> None:
+        assert_type(require_component(state, "jobs"), JobRegistry)
+        assert_type(require_component(state, "bus"), EventBus)
+        assert_type(require_component(state, "db"), Database)
+        assert_type(require_component(state, "manager"), PipelineManager)
 
 
 # ------------------------------------------------------------------
