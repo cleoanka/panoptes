@@ -363,6 +363,41 @@ async def test_retention_purges_old_rows_and_snapshots(tmp_path) -> None:
     await db.disconnect()
 
 
+async def test_retention_prunes_emptied_snapshot_dirs(tmp_path) -> None:
+    db = make_db()
+    await db.connect()
+    now = time.time()
+    old_ts = now - 40 * 86_400.0  # beyond the 30-day window
+
+    # Production layout: media/<stream>/<YYYYMMDD>/<event>.jpg. One day-folder
+    # goes fully empty, a sibling keeps a fresh file, an unrelated stream is
+    # untouched — only the emptied leaf (and its now-empty stream parent) prune.
+    media = tmp_path / "media"
+    empty_day = media / "cam1" / "20250101"
+    empty_day.mkdir(parents=True)
+    stale = empty_day / "e1.jpg"
+    stale.write_bytes(b"jpeg")
+    os.utime(stale, (old_ts, old_ts))
+
+    kept_day = media / "cam2" / "20250102"
+    kept_day.mkdir(parents=True)
+    fresh = kept_day / "e2.jpg"
+    fresh.write_bytes(b"jpeg")  # current mtime — survives
+
+    counts = await purge_once(
+        db,
+        DatabaseConfig(url=MEM_URL, retention_days=None),
+        PrivacyConfig(snapshot_retention_days=30),
+        media,
+    )
+    assert counts["snapshots"] == 1
+    assert not empty_day.exists()  # emptied day-folder removed
+    assert not (media / "cam1").exists()  # its now-empty stream parent too
+    assert fresh.exists() and kept_day.exists()  # non-empty leaf untouched
+    assert media.is_dir()  # media_dir itself is never pruned
+    await db.disconnect()
+
+
 async def test_retention_none_keeps_everything(tmp_path) -> None:
     db = make_db()
     await db.connect()
