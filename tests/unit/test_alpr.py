@@ -313,6 +313,34 @@ class TestCorrectAndValidate:
             assert r.corrected is False
             assert r.text == normalize(garbage)  # untouched, no synthesised plate
 
+    def test_all_digit_blob_is_not_fabricated_into_a_plate(self) -> None:
+        # An OCR blob with *no* letters in the letter slot must never be coerced
+        # into a "valid" plate: a digit->letter swap is single-glyph recovery,
+        # not synthesis. Before the anchor guard, "3450000" was faked into
+        # "34S0000" (5->S) and "8100000" into "81O0000" (0->O), letting an
+        # all-digit read clear validation and enter the voter / watchlist path.
+        for blob in ("3450000", "8100000", "0000000", "1234567", "5060708"):
+            r = correct_and_validate(blob)
+            assert r.valid is False
+            assert r.country is None
+            assert r.corrected is False
+            assert r.text == normalize(blob)  # returned verbatim, no invented letters
+
+    def test_letter_slot_needs_a_real_letter_to_coerce(self) -> None:
+        # The digit->letter coercion fires only when a real letter already
+        # anchors the letter slot; the pinned corrections each keep >=1 genuine
+        # letter, while a fully-numeric letter slot is left untouched.
+        assert correct_and_validate("34A8C123").text == "34ABC123"  # A, C anchor "A8C"
+        assert correct_and_validate("341BC123").text == "34IBC123"  # B, C anchor "1BC"
+        # Single-letter slot with a mangled letter has no anchor and is a
+        # coin-flip vs a plain number -> correctly rejected, not fabricated.
+        for lone in ("0681234", "3451234"):
+            r = correct_and_validate(lone)
+            assert r.valid is False and r.corrected is False
+        # _coerce refuses an unanchored letter slot even in aggressive mode.
+        assert _coerce("3450000", 1, aggressive=True) is None
+        assert _coerce("34AB123", 2, aggressive=True) == "34AB123"  # A, B are real
+
     def test_length_bounds_short_circuit(self) -> None:
         # Below 5 or above 10 chars there is no legal TR shape to coerce into.
         for plate in ("34AB", "3", "34ABC123456"):

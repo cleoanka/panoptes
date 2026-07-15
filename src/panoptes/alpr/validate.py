@@ -91,13 +91,19 @@ def _coerce(text: str, n_letters: int, aggressive: bool) -> str | None:
     return the corrected string or None if impossible."""
     to_digit = _TO_DIGIT if aggressive else _TO_DIGIT_SAFE
     to_letter = _TO_LETTER if aggressive else _TO_LETTER_SAFE
+    # A digit->letter substitution is single-glyph OCR recovery, not plate
+    # synthesis: require at least one *real* letter already anchoring the
+    # letter slot, otherwise an all-digit blob would be fabricated into a
+    # "valid" plate by inventing letters where OCR saw only digits.
+    letter_slot = text[2 : 2 + n_letters]
+    anchored = any(c in TR_LETTERS for c in letter_slot)
     out: list[str] = []
     for i, ch in enumerate(text):
         want_letter = 2 <= i < 2 + n_letters
         if want_letter:
             if ch in TR_LETTERS:
                 out.append(ch)
-            elif ch in to_letter and to_letter[ch] in TR_LETTERS:
+            elif anchored and ch in to_letter and to_letter[ch] in TR_LETTERS:
                 out.append(to_letter[ch])
             else:
                 return None
