@@ -27,6 +27,7 @@ from starlette.websockets import WebSocketDisconnect
 import panoptes.observability
 import panoptes.pipeline
 import panoptes.storage
+from panoptes.analytics.rules.actions import ActionDispatcher
 from panoptes.api import create_app
 from panoptes.api.app import AppState
 from panoptes.api.auth import require_component
@@ -419,6 +420,53 @@ async def test_lifespan_disconnects_db_on_startup_failure(
             pass  # pragma: no cover - startup fails before entering
     assert FakeDatabase.last is not None
     assert FakeDatabase.last.connected is False
+
+
+async def test_lifespan_drains_action_dispatcher_on_shutdown(
+    fakes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The rules engine starts the process-wide ActionDispatcher lazily, so the
+    # lifespan teardown must invoke close_shared() to flush queued deliveries
+    # and join the daemon worker (the round-3 unit test never went through the
+    # lifespan, so it could not catch this wiring being absent).
+    calls: list[int] = []
+    monkeypatch.setattr(ActionDispatcher, "close_shared", classmethod(lambda cls: calls.append(1)))
+    app = create_app(make_config(tmp_path))
+    async with app.router.lifespan_context(app):
+        assert calls == []  # not yet: still serving
+    assert calls == [1]  # drained exactly once on shutdown
+
+
+async def test_lifespan_flushes_queued_webhook_across_full_cycle(
+    fakes: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # End-to-end: a webhook queued on the shared singleton during the request
+    # phase must be delivered (not dropped with the daemon thread) once the
+    # lifespan shutdown drains it.
+    posted: list[str] = []
+
+    def fake_post(url: str, **kwargs: Any) -> Any:
+        posted.append(url)
+
+        class _Resp:
+            status_code = 200
+
+        return _Resp()
+
+    monkeypatch.setattr("panoptes.analytics.rules.actions.httpx.post", fake_post)
+    ActionDispatcher._shared = None  # fresh singleton for this test
+    try:
+        app = create_app(make_config(tmp_path))
+        async with app.router.lifespan_context(app):
+            dispatcher = ActionDispatcher.shared()
+            dispatcher.dispatch(_event(EventType.RULE_TRIGGERED), [WebhookAction(url=WEBHOOK_URL)])
+        assert posted == [WEBHOOK_URL]  # flushed by the shutdown drain
+        # The drain must have joined+closed the worker, not left it alive to
+        # die with the interpreter; close() sets _closed and joins the thread.
+        assert dispatcher._closed is True
+        assert dispatcher._thread is not None and not dispatcher._thread.is_alive()
+    finally:
+        ActionDispatcher._shared = None
 
 
 # ------------------------------------------------------------------
