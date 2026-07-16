@@ -241,21 +241,33 @@ class PipelineManager:
         The ALPR detector/OCR and attribute extractors each hold native
         (and CoreML/CUDA) onnxruntime sessions; dropping the processor
         alone defers their release to GC. Free them eagerly so restarted
-        jobs don't pile sessions up. Each ``close()`` is optional and
-        guarded — a fake or a degraded (extra-not-installed) stage may not
-        expose one, and one failing must not mask the others.
+        jobs don't pile sessions up.
+
+        The attribute pipeline exposes ``close()``; the ALPR pipeline has
+        no such hook, so its detector/OCR model references (``_detector``/
+        ``_ocr``) are dropped directly to make those sessions GC-eligible.
+        Every release is optional and guarded — a fake or a degraded
+        (extra-not-installed) stage may lack the hook/attributes, and one
+        failing must not mask the others.
         """
         for stage in (
             getattr(processor, "_attributes", None),
             getattr(processor, "_alpr", None),
         ):
-            close = getattr(stage, "close", None)
-            if close is None:
+            if stage is None:
                 continue
             try:
-                close()
-            except Exception:  # best-effort teardown: one failure must not mask the rest
-                logger.warning("error releasing model session on %s", type(stage).__name__)
+                close = getattr(stage, "close", None)
+                if close is not None:
+                    close()
+                # ALPR has no close(): drop the onnxruntime-backed model refs
+                for attr in ("_detector", "_ocr"):
+                    if hasattr(stage, attr):
+                        setattr(stage, attr, None)
+            except Exception as exc:  # best-effort teardown: one failure must not mask the rest
+                logger.warning(
+                    "error releasing model session on %s: %s", type(stage).__name__, exc
+                )
 
     @staticmethod
     def _open_writer(
@@ -276,5 +288,10 @@ class PipelineManager:
         )
         if not writer.isOpened():  # degrade: results still returned without video
             writer.release()
+            logger.warning(
+                "annotated video writer failed to open at %s (codec/path?); "
+                "returning results without annotated video",
+                out,
+            )
             return None, None
         return writer, str(out)

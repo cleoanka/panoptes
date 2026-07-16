@@ -9,9 +9,11 @@ runtime is ever imported.
 from __future__ import annotations
 
 import itertools
+import logging
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import cv2
@@ -723,19 +725,29 @@ def test_process_video_releases_model_sessions_on_teardown(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_components
 ):
     """The per-job StreamProcessor's ALPR/attribute model sessions must be
-    closed on teardown so native/GPU memory is not held across jobs."""
+    released on teardown so native/GPU memory is not held across jobs.
+
+    Attributes expose ``close()``; the real AlprPipeline has no such hook,
+    so this double mirrors it (``_detector``/``_ocr`` model refs) and the
+    release must drop those references — the production path the earlier
+    synthetic ``close()`` on the ALPR fake never exercised.
+    """
     closed: list[str] = []
+    alprs: list[SessionAlpr] = []
 
     class ClosingAttributes(FakeAttributes):
         def close(self) -> None:
             closed.append("attributes")
 
-    class ClosingAlpr(FakeAlpr):
-        def close(self) -> None:
-            closed.append("alpr")
+    class SessionAlpr(FakeAlpr):
+        def __init__(self, config, watchlists, privacy) -> None:
+            super().__init__(config, watchlists, privacy)
+            self._detector = object()  # stand-in onnxruntime-backed detector
+            self._ocr = object()  # stand-in onnxruntime-backed OCR
+            alprs.append(self)
 
     monkeypatch.setattr(panoptes.attributes, "AttributePipeline", ClosingAttributes)
-    monkeypatch.setattr(panoptes.alpr, "AlprPipeline", ClosingAlpr)
+    monkeypatch.setattr(panoptes.alpr, "AlprPipeline", SessionAlpr)
 
     video = write_video(tmp_path / "input.mp4")
     config = AppConfig(streams=[], server=ServerConfig(media_dir=str(tmp_path / "media")))
@@ -745,7 +757,53 @@ def test_process_video_releases_model_sessions_on_teardown(
     finally:
         manager.stop()
 
-    assert closed == ["attributes", "alpr"]
+    assert closed == ["attributes"]
+    # the real AlprPipeline has no close(): its native model refs are dropped
+    assert alprs and alprs[0]._detector is None and alprs[0]._ocr is None
+
+
+def test_release_processor_failure_logs_the_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing release is best-effort but must name the exception, not
+    just the stage — so the operator knows WHAT failed."""
+
+    class Boom:
+        def close(self) -> None:
+            raise RuntimeError("session teardown exploded")
+
+    processor = types.SimpleNamespace(_attributes=Boom(), _alpr=None)
+    with caplog.at_level(logging.WARNING, logger="panoptes.pipeline.manager"):
+        PipelineManager._release_processor(processor)  # type: ignore[arg-type]
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Boom" in warnings[0].message
+    assert "session teardown exploded" in warnings[0].message
+
+
+def test_open_writer_open_failure_logs_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A VideoWriter that fails to open degrades to no annotated video, but
+    the silent path must leave a server-side reason in the log."""
+
+    class UnopenableWriter:
+        def isOpened(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(cv2, "VideoWriter", lambda *args, **kwargs: UnopenableWriter())
+    out = tmp_path / "annotated.mp4"
+    with caplog.at_level(logging.WARNING, logger="panoptes.pipeline.manager"):
+        writer, writer_path = PipelineManager._open_writer(out, 30.0, (48, 64, 3))
+
+    assert writer is None and writer_path is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(out) in warnings[0].message
 
 
 def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
