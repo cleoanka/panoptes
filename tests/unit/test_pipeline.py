@@ -400,6 +400,36 @@ def test_scheduler_propagates_detector_error_to_all_futures():
         scheduler.close()
 
 
+def test_scheduler_logs_detector_failure_at_origin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A detector failure must be logged once at its origin (the inference
+    thread) with a traceback — otherwise it is invisible operator-side, since
+    the exception only surfaces where a future is awaited."""
+    detector = GateDetector(fail_after_gate=True)
+    scheduler = InferenceScheduler(detector, max_batch=8, max_delay_ms=20)
+    try:
+        sacrificial = threading.Thread(target=scheduler.infer, args=(_marked_frame(1),))
+        sacrificial.start()
+        wait_for(detector.first_call_seen.is_set, message="first batch pickup")
+
+        racer = scheduler.submit(_marked_frame(7))
+        wait_for(lambda: scheduler._queue.qsize() >= 1, message="queued submission")
+        with caplog.at_level(logging.ERROR, logger="panoptes.pipeline.scheduler"):
+            detector.gate.set()
+            sacrificial.join(5.0)
+            with pytest.raises(RuntimeError, match="boom"):
+                racer.result(5.0)
+    finally:
+        scheduler.close()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "detector batch" in errors[0].message
+    # the traceback is captured (logger.exception), not just the message
+    assert errors[0].exc_info is not None
+
+
 def test_scheduler_close_drains_and_rejects_new_work():
     class SlowDetector:
         def infer(self, frames):

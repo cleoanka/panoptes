@@ -14,6 +14,7 @@ block on ``put`` — natural backpressure instead of unbounded memory.
 from __future__ import annotations
 
 import contextlib
+import logging
 import queue
 import threading
 import time
@@ -28,6 +29,8 @@ if TYPE_CHECKING:
     from panoptes.detect.base import Detector
 
 __all__ = ["InferenceScheduler", "metric_handle"]
+
+logger = logging.getLogger(__name__)
 
 _SENTINEL = object()
 
@@ -212,6 +215,10 @@ class InferenceScheduler:
                     f"detector returned {len(results)} results for {len(frames)} frames"
                 )
         except Exception as exc:
+            # Log once at the origin (this daemon thread), before fanning the
+            # failure out to every waiting future — the exception otherwise
+            # surfaces only where a future is awaited and leaves no traceback.
+            logger.exception("detector batch of %d frames failed", len(frames))
             for _, future in batch:
                 future.set_exception(exc)
             return
