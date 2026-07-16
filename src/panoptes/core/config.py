@@ -113,15 +113,18 @@ class StoppedVehicleConfig(BaseModel):
     ``min_stopped_s`` emits one STOPPED_VEHICLE event."""
 
     enabled: bool = False
-    max_speed_kmh: float = 3.0   # at or below this counts as 'stopped'
-    min_stopped_s: float = 10.0  # dwell below the threshold before alerting
+    max_speed_kmh: float = Field(default=3.0, ge=0.0)   # at or below this counts as 'stopped'
+    min_stopped_s: float = Field(default=10.0, ge=0.0)  # dwell before alerting
 
 
 class SpeedConfig(BaseModel):
     enabled: bool = True
-    window_s: float = 1.0        # sliding window for velocity estimation
-    min_track_s: float = 0.7     # don't report speed for younger tracks
-    ema_alpha: float = 0.35      # exponential smoothing of the km/h value
+    window_s: float = Field(default=1.0, gt=0.0)     # sliding window for velocity estimation
+    min_track_s: float = Field(default=0.7, ge=0.0)  # don't report speed for younger tracks
+    # EMA smoothing of the km/h value; the recurrence is only contractive
+    # (stable) for alpha in (0, 1], so bound it there — an out-of-range
+    # alpha diverges and corrupts SPEEDING/STOPPED decisions.
+    ema_alpha: float = Field(default=0.35, gt=0.0, le=1.0)
     limit_kmh: float | None = None  # emits SPEEDING events when exceeded
     stopped: StoppedVehicleConfig = Field(default_factory=StoppedVehicleConfig)
 

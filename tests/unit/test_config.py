@@ -14,6 +14,8 @@ from panoptes.core.config import (
     LineCrossCondition,
     RuleConfig,
     SnapshotConfig,
+    SpeedConfig,
+    StoppedVehicleConfig,
     StreamConfig,
     ZoneConfig,
     ZoneDwellCondition,
@@ -108,3 +110,46 @@ def test_snapshot_default_includes_stopped_vehicle() -> None:
     """STOPPED_VEHICLE captures a snapshot by default, like its sibling
     WRONG_WAY (the P8 follow-through)."""
     assert EventType.STOPPED_VEHICLE.value in SnapshotConfig().on_events
+
+
+# -- speed numeric bounds ---------------------------------------------
+@pytest.mark.parametrize("alpha", [-0.5, 0.0, 1.5, 2.5])
+def test_speed_ema_alpha_out_of_range_rejected(alpha: float) -> None:
+    """The EMA recurrence is only contractive for alpha in (0, 1]; an
+    out-of-range value diverges and corrupts SPEEDING/STOPPED math, so it
+    must fail fast at startup rather than silently produce garbage speeds."""
+    with pytest.raises(ValueError):
+        SpeedConfig(ema_alpha=alpha)
+
+
+@pytest.mark.parametrize("alpha", [0.01, 0.35, 1.0])
+def test_speed_ema_alpha_in_range_accepted(alpha: float) -> None:
+    assert SpeedConfig(ema_alpha=alpha).ema_alpha == alpha
+
+
+@pytest.mark.parametrize("window_s", [0.0, -1.0])
+def test_speed_window_s_non_positive_rejected(window_s: float) -> None:
+    """window_s <= 0 makes the reference-window logic never estimate a
+    speed (no prior point can precede the current timestamp)."""
+    with pytest.raises(ValueError):
+        SpeedConfig(window_s=window_s)
+
+
+def test_speed_min_track_s_negative_rejected() -> None:
+    with pytest.raises(ValueError):
+        SpeedConfig(min_track_s=-1.0)
+
+
+def test_speed_defaults_are_valid() -> None:
+    cfg = SpeedConfig()
+    assert cfg.ema_alpha == 0.35
+    assert cfg.window_s == 1.0
+    assert cfg.min_track_s == 0.7
+
+
+@pytest.mark.parametrize(
+    "kwargs", [{"max_speed_kmh": -1.0}, {"min_stopped_s": -5.0}]
+)
+def test_stopped_vehicle_negative_thresholds_rejected(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError):
+        StoppedVehicleConfig(**kwargs)
