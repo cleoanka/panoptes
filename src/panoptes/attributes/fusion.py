@@ -10,6 +10,8 @@ incumbent, so a single bad frame cannot repaint a car.
 
 from __future__ import annotations
 
+import math
+
 from panoptes.core.types import AttributeValue, Track
 
 __all__ = ["AttributeFuser"]
@@ -30,7 +32,11 @@ class AttributeFuser:
         ``confidence = winner_mass / total_mass`` — consensus purity, not
         a single-frame score — and the number of accepted observations.
         """
-        if not value or confidence <= 0.0:
+        # A non-finite confidence (NaN/inf from a degenerate softmax over a
+        # corrupt ONNX output) slips past ``confidence <= 0.0`` and would
+        # permanently poison this value's mass and the winner ratio; drop it,
+        # like the ALPR voter path.
+        if not value or not math.isfinite(confidence) or confidence <= 0.0:
             return  # zero-mass evidence would only distort the ratio
         confidence = min(confidence, 1.0)
         state_key = (track.track_id, key)
@@ -52,3 +58,7 @@ class AttributeFuser:
         for state_key in stale:
             del self._evidence[state_key]
             self._observations.pop(state_key, None)
+
+    def tracked_ids(self) -> set[int]:
+        """Track ids currently holding fusion state (for pruning)."""
+        return {state_key[0] for state_key in self._evidence}

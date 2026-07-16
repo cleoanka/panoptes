@@ -8,6 +8,7 @@ imported.
 from __future__ import annotations
 
 import logging
+import math
 import sys
 import types
 from typing import Any
@@ -177,6 +178,24 @@ def test_fusion_ignores_zero_confidence_and_clamps() -> None:
     assert track.attributes["color"].confidence == pytest.approx(1.0)
 
 
+def test_fusion_rejects_non_finite_confidence() -> None:
+    # A NaN/inf confidence (degenerate softmax over a corrupt ONNX output)
+    # slips past ``<= 0.0`` and would poison the value's mass forever.
+    fuser = AttributeFuser()
+    track = make_track()
+
+    fuser.observe(track, "color", "red", 0.8)
+    fuser.observe(track, "color", "blue", float("nan"))  # dropped, not folded
+    attr = track.attributes["color"]
+    assert attr.value == "red"
+    assert math.isfinite(attr.confidence)
+    assert attr.confidence == pytest.approx(1.0)  # red still the only mass
+    assert attr.n_observations == 1
+
+    fuser.observe(track, "color", "green", float("inf"))  # also dropped
+    assert track.attributes["color"].value == "red"
+
+
 def test_fusion_forget_resets_evidence() -> None:
     fuser = AttributeFuser()
     track = make_track()
@@ -232,6 +251,35 @@ def test_pipeline_forgets_finished_tracks() -> None:
     track.state = TrackState.ACTIVE
     pipeline.process(frame=frame, tracks=[track], frame_index=3)
     assert track.attributes["color"].n_observations == 1  # evidence was reset
+
+
+def test_pipeline_prunes_tracks_absent_from_scene() -> None:
+    # The real tracker retires a finished track by dropping it from the live
+    # list, not by handing it back FINISHED. Evidence must still be released.
+    config = AttributesConfig(color=ColorConfig(every_n_frames=1))
+    pipeline = AttributePipeline(config)
+    frame = solid_frame((255, 0, 0))
+    track = make_track()
+    other = make_track(track_id=2)
+
+    pipeline.process(frame=frame, tracks=[track, other], frame_index=0)
+    assert pipeline.fuser.tracked_ids() == {1, 2}
+
+    # `track` vanishes from the scene; only `other` remains observed.
+    pipeline.process(frame=frame, tracks=[other], frame_index=1)
+    assert pipeline.fuser.tracked_ids() == {2}
+
+
+def test_pipeline_forget_releases_fusion_state() -> None:
+    config = AttributesConfig(color=ColorConfig(every_n_frames=1))
+    pipeline = AttributePipeline(config)
+    frame = solid_frame((255, 0, 0))
+    track = make_track()
+    pipeline.process(frame=frame, tracks=[track], frame_index=0)
+    assert pipeline.fuser.tracked_ids() == {1}
+
+    pipeline.forget(track.track_id)
+    assert pipeline.fuser.tracked_ids() == set()
 
 
 def test_pipeline_frame_index_rewind_resets_schedule() -> None:
