@@ -719,6 +719,35 @@ def test_process_video_end_to_end(tmp_path: Path, fake_components):
     _assert_no_leaked_threads(before)
 
 
+def test_process_video_releases_model_sessions_on_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_components
+):
+    """The per-job StreamProcessor's ALPR/attribute model sessions must be
+    closed on teardown so native/GPU memory is not held across jobs."""
+    closed: list[str] = []
+
+    class ClosingAttributes(FakeAttributes):
+        def close(self) -> None:
+            closed.append("attributes")
+
+    class ClosingAlpr(FakeAlpr):
+        def close(self) -> None:
+            closed.append("alpr")
+
+    monkeypatch.setattr(panoptes.attributes, "AttributePipeline", ClosingAttributes)
+    monkeypatch.setattr(panoptes.alpr, "AlprPipeline", ClosingAlpr)
+
+    video = write_video(tmp_path / "input.mp4")
+    config = AppConfig(streams=[], server=ServerConfig(media_dir=str(tmp_path / "media")))
+    manager = PipelineManager(config, EventBus())
+    try:
+        manager.process_video(video, StreamConfig(id="job1", source=str(video)))
+    finally:
+        manager.stop()
+
+    assert closed == ["attributes", "alpr"]
+
+
 def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
     video = write_video(tmp_path / "input.mp4")
     stream = StreamConfig(

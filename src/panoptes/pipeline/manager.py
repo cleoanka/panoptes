@@ -7,6 +7,7 @@ stream. All public methods are safe to call from ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -26,6 +27,8 @@ if TYPE_CHECKING:
     from panoptes.detect.base import Detector
 
 __all__ = ["PipelineManager"]
+
+logger = logging.getLogger(__name__)
 
 _PROGRESS_EVERY_N_FRAMES = 5
 
@@ -209,6 +212,7 @@ class PipelineManager:
                     progress_cb(min(0.99, processor.frames_seen / source.frame_count))
             processor.finalize(time.time())
         finally:
+            self._release_processor(processor)
             source.close()
             if writer is not None:
                 writer.release()
@@ -229,6 +233,29 @@ class PipelineManager:
             "counters": processor.summary(),
             "annotated_path": writer_path,
         }
+
+    @staticmethod
+    def _release_processor(processor: StreamProcessor) -> None:
+        """Release a batch processor's per-stream model sessions.
+
+        The ALPR detector/OCR and attribute extractors each hold native
+        (and CoreML/CUDA) onnxruntime sessions; dropping the processor
+        alone defers their release to GC. Free them eagerly so restarted
+        jobs don't pile sessions up. Each ``close()`` is optional and
+        guarded — a fake or a degraded (extra-not-installed) stage may not
+        expose one, and one failing must not mask the others.
+        """
+        for stage in (
+            getattr(processor, "_attributes", None),
+            getattr(processor, "_alpr", None),
+        ):
+            close = getattr(stage, "close", None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception:  # best-effort teardown: one failure must not mask the rest
+                logger.warning("error releasing model session on %s", type(stage).__name__)
 
     @staticmethod
     def _open_writer(
