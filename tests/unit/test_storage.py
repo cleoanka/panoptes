@@ -497,3 +497,86 @@ def test_plate_data_keys_single_source_of_truth() -> None:
 
     assert dbmod._PLATE_DATA_KEYS is PLATE_DATA_KEYS
     assert redact.PLATE_DATA_KEYS is PLATE_DATA_KEYS
+
+
+def _event(i: int, now: float) -> Event:
+    return Event(
+        type=EventType.LINE_CROSSED,
+        stream_id="cam1",
+        timestamp=float(i),
+        wall_ts=now + i,
+        track_id=i + 1,
+        data={},
+    )
+
+
+async def test_per_event_fallback_drops_only_poison_event() -> None:
+    # In per-event mode a genuine per-row poison (IntegrityError) is dropped,
+    # but the surrounding valid events still persist one by one.
+    from sqlalchemy.exc import IntegrityError
+
+    from panoptes.storage.db import _FLUSH_FAILURES_BEFORE_FALLBACK
+
+    db = make_db(flush_interval=60.0)  # drive flush() by hand
+    await db.connect()
+    now = time.time()
+    batch = [_event(i, now) for i in range(3)]
+    with db._buffer_lock:
+        db._buffer = list(batch)
+    db._flush_failures = _FLUSH_FAILURES_BEFORE_FALLBACK  # arm the fallback
+
+    real_flush_batch = db._flush_batch
+
+    async def flaky(one: list[Event]) -> None:
+        if one[0] is batch[1]:  # the middle event is poison
+            raise IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed"))
+        await real_flush_batch(one)
+
+    db._flush_batch = flaky  # type: ignore[method-assign]
+    await db.flush()
+
+    rows = await db.events.query(stream="cam1", type="line_crossed")
+    # only the poison middle event is gone; the other two persisted
+    assert {r["timestamp"] for r in rows} == {0.0, 2.0}
+    with db._buffer_lock:
+        assert db._buffer == []  # nothing re-queued
+    await db.disconnect()
+
+
+async def test_per_event_fallback_requeues_on_transient_error() -> None:
+    # A TRANSIENT error inside per-event mode ("database is locked" etc.) must
+    # NOT drop the event: the remaining slice is re-queued and the pass
+    # re-raises, so the next flush retries it — no silent data loss.
+    from sqlalchemy.exc import OperationalError
+
+    from panoptes.storage.db import _FLUSH_FAILURES_BEFORE_FALLBACK
+
+    db = make_db(flush_interval=60.0)
+    await db.connect()
+    now = time.time()
+    batch = [_event(i, now) for i in range(3)]
+    with db._buffer_lock:
+        db._buffer = list(batch)
+    db._flush_failures = _FLUSH_FAILURES_BEFORE_FALLBACK  # arm the fallback
+
+    real_flush_batch = db._flush_batch
+
+    async def flaky(one: list[Event]) -> None:
+        if one[0] is batch[1]:  # transient blip on the middle event, once
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+        await real_flush_batch(one)
+
+    db._flush_batch = flaky  # type: ignore[method-assign]
+    with pytest.raises(OperationalError):
+        await db.flush()
+
+    # the first event committed; the failing one plus its tail are re-queued
+    with db._buffer_lock:
+        assert [e.timestamp for e in db._buffer] == [1.0, 2.0]
+
+    # a retry with the blip cleared drains everything — nothing was lost
+    db._flush_batch = real_flush_batch  # type: ignore[method-assign]
+    await db.flush()
+    rows = await db.events.query(stream="cam1", type="line_crossed")
+    assert {r["timestamp"] for r in rows} == {0.0, 1.0, 2.0}
+    await db.disconnect()

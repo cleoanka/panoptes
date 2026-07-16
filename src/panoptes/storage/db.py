@@ -26,6 +26,7 @@ from types import TracebackType
 from typing import Any
 
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -278,19 +279,27 @@ class Database:
 
     async def _flush_per_event(self, batch: list[Event]) -> None:
         """Poison-batch fallback: one transaction per event so valid events
-        persist and only the individually failing ones are dropped."""
+        persist and only the genuinely poison ones are dropped.
+
+        Only a per-row/permanent error (``IntegrityError`` / ``DataError`` —
+        constraint violation, oversized/bad column) is treated as poison and
+        dropped with a log. Any other failure (``OperationalError`` "database
+        is locked", disconnect, disk full) is transient: the remaining slice
+        is re-queued and re-raised so the next flush retries it, mirroring
+        ``_flush_batch``'s contract that a failed pass never loses events."""
         for index, event in enumerate(batch):
             try:
                 await self._flush_batch([event])
-            except asyncio.CancelledError:
-                # Shutdown mid-pass: everything not yet committed goes back
-                # for the final flush; already-committed events stay out.
-                self._requeue(batch[index:])
-                raise
-            except Exception:
+            except (IntegrityError, DataError):
                 logger.exception(
                     "dropping unpersistable event %s (%s)", event.id, event.type
                 )
+            except BaseException:
+                # Transient (or cancellation at shutdown): everything not yet
+                # committed goes back for the next/final flush; already
+                # committed events stay out.
+                self._requeue(batch[index:])
+                raise
 
     def _requeue(self, batch: list[Event]) -> None:
         """Re-prepend a failed batch so the next flush retries it,
