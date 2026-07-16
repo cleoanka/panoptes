@@ -44,6 +44,7 @@ async def list_tracks(
         None, description="plate text, exact at-rest match (hashed mode: exact full plate)"
     ),
     since: float | None = Query(None, description="minimum last_wall_ts (UNIX seconds)"),
+    until: float | None = Query(None, description="maximum last_wall_ts (UNIX seconds)"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list[TrackOut]:
@@ -57,6 +58,7 @@ async def list_tracks(
             vehicle_class=vclass,
             plate=plate,
             since=since,
+            until=until,
             limit=limit,
             offset=offset,
         )

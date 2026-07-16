@@ -29,6 +29,7 @@ async def search_plates(
     ),
     stream: str | None = Query(None, description="stream id filter"),
     since: float | None = Query(None, description="minimum wall_ts (UNIX seconds)"),
+    until: float | None = Query(None, description="maximum wall_ts (UNIX seconds)"),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0, description="skip this many rows (pagination)"),
 ) -> list[PlateOut]:
@@ -36,6 +37,6 @@ async def search_plates(
     # before matching — the API never sees or handles the salt here.
     db = require_component(get_state(request), "db")
     rows = await _maybe_await(
-        db.plates.search(q=q, stream=stream, since=since, limit=limit, offset=offset)
+        db.plates.search(q=q, stream=stream, since=since, until=until, limit=limit, offset=offset)
     )
     return [coerce(PlateOut, row) for row in rows]

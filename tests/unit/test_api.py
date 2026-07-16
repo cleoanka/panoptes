@@ -789,7 +789,7 @@ async def test_plates_search(app_client) -> None:
     )
     assert resp.status_code == 200
     assert repo.last_kwargs == {
-        "q": "34ABC", "stream": "cam1", "since": None, "limit": 10, "offset": 0,
+        "q": "34ABC", "stream": "cam1", "since": None, "until": None, "limit": 10, "offset": 0,
     }
     (row,) = resp.json()
     assert row["plate"] == "34ABC123"
@@ -861,6 +861,7 @@ async def test_tracks_query_params_forwarded(app_client) -> None:
         "vehicle_class": "car",
         "plate": "34ABC123",
         "since": 1.0,
+        "until": None,
         "limit": 5,
         "offset": 3,
     }
@@ -871,6 +872,18 @@ async def test_tracks_query_params_forwarded(app_client) -> None:
     # were silently null before TrackOut aliased them).
     assert row["vehicle_class"] == "car"
     assert row["plate_text"] == "34ABC123"
+
+
+async def test_tracks_and_plates_forward_until_bound(app_client) -> None:
+    # The upper time bound present on /events must exist on the sibling history
+    # endpoints too; each forwards `until` to its repo query.
+    client, app = app_client
+    app.state.panoptes.db.tracks.rows = []
+    app.state.panoptes.db.plates.rows = []
+    await client.get("/api/v1/tracks", params={"since": 10.0, "until": 20.0}, headers=AUTH)
+    assert app.state.panoptes.db.tracks.last_kwargs["until"] == 20.0
+    await client.get("/api/v1/plates", params={"until": 99.0}, headers=AUTH)
+    assert app.state.panoptes.db.plates.last_kwargs["until"] == 99.0
 
 
 async def test_tracks_invalid_class_filter(app_client) -> None:
