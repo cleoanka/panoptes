@@ -636,6 +636,34 @@ class TestActionDispatcher:
         dispatcher.close()
         assert calls == ["http://localhost:9/hook"]
 
+    def test_close_shared_drains_singleton(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[str] = []
+
+        def fake_post(url: str, **kwargs: Any) -> Any:
+            calls.append(url)
+
+            class _Resp:
+                status_code = 200
+
+            return _Resp()
+
+        monkeypatch.setattr(actions_mod.httpx, "post", fake_post)
+        ActionDispatcher._shared = None  # fresh singleton for this test
+        try:
+            dispatcher = ActionDispatcher.shared()
+            event = make_event(EventType.RULE_TRIGGERED, {"rule_name": "x"})
+            dispatcher.dispatch(event, [WebhookAction(url="http://localhost:9/hook")])
+            ActionDispatcher.close_shared()  # shutdown hook: flush + join, not drop
+            assert calls == ["http://localhost:9/hook"]
+            assert dispatcher._closed is True
+        finally:
+            ActionDispatcher._shared = None
+
+    def test_close_shared_noop_without_singleton(self) -> None:
+        ActionDispatcher._shared = None
+        ActionDispatcher.close_shared()  # must not raise when nothing was started
+        assert ActionDispatcher._shared is None
+
 
 # ---------------------------------------------------------------------
 # analytics engine facade
