@@ -26,6 +26,18 @@ router = APIRouter(dependencies=[Depends(api_key_dependency)])
 _KEEPALIVE_S = 15.0  # SSE comment ping period so proxies don't cut idle streams
 
 
+class _EventStreamResponse(StreamingResponse):
+    """A ``StreamingResponse`` whose media type is fixed to ``text/event-stream``.
+
+    FastAPI cannot infer the media type of a bare ``StreamingResponse`` and
+    falls back to ``application/json`` in the OpenAPI spec. Declaring this as
+    the route's ``response_class`` makes the documented 200 content type match
+    what the endpoint actually emits, so codegen clients expect SSE, not JSON.
+    """
+
+    media_type = "text/event-stream"
+
+
 def _validated(value: str | None, enum: type[Enum], param: str) -> str | None:
     if value is None:
         return None
@@ -97,7 +109,7 @@ async def list_events(
     return [coerce(EventOut, row) for row in rows]
 
 
-@router.get("/stream")
+@router.get("/stream", response_class=_EventStreamResponse)
 async def stream_events(
     request: Request,
     types: str | None = Query(None, description="comma-separated event types to forward"),
@@ -137,9 +149,8 @@ async def stream_events(
         finally:
             bus.unsubscribe(sub_id)
 
-    return StreamingResponse(
+    return _EventStreamResponse(
         generate(),
-        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",

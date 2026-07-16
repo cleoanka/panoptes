@@ -357,6 +357,29 @@ async def test_cors_never_allows_credentials(app_client) -> None:
     assert "access-control-allow-credentials" not in resp.headers
 
 
+def test_openapi_advertises_api_key_security(fakes: None, tmp_path: Path) -> None:
+    # Every protected route depends on api_key_dependency, which now carries
+    # an APIKeyHeader scheme: the spec must declare it and attach `security`
+    # to the operations so generated SDKs and the /docs Authorize button know
+    # to send X-API-Key (not treat the API as public).
+    spec = create_app(make_config(tmp_path)).openapi()
+    schemes = (spec.get("components") or {}).get("securitySchemes") or {}
+    assert schemes == {
+        "APIKeyHeader": {"type": "apiKey", "in": "header", "name": "X-API-Key"}
+    }
+    protected = spec["paths"]["/api/v1/system/info"]["get"]
+    assert protected["security"] == [{"APIKeyHeader": []}]
+
+
+def test_openapi_stream_declares_event_stream_media_type(fakes: None, tmp_path: Path) -> None:
+    # The SSE feed returns text/event-stream at runtime; the documented 200
+    # content type must match (FastAPI otherwise defaults a bare
+    # StreamingResponse to application/json, misleading codegen clients).
+    spec = create_app(make_config(tmp_path)).openapi()
+    content = spec["paths"]["/api/v1/events/stream"]["get"]["responses"]["200"]["content"]
+    assert set(content) == {"text/event-stream"}
+
+
 # ------------------------------------------------------------------
 # Lifespan wiring
 # ------------------------------------------------------------------
