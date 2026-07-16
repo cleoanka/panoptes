@@ -1011,6 +1011,32 @@ async def test_video_job_error_still_deletes_upload(app_client) -> None:
     assert not list(upload_dir.glob("*")), "upload not deleted after job error"
 
 
+async def test_job_error_logs_traceback_keeps_concise_message(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A failing job must stay diagnosable: the concise message goes to the
+    # API `error` field, but the full traceback is logged server-side (the
+    # rest of the media-job chain discards it).
+    reg = JobRegistry()
+
+    def boom(progress: Any) -> dict[str, Any]:
+        raise ValueError("bad codec")
+
+    with caplog.at_level("ERROR", logger="panoptes.api.jobs"):
+        job_id = reg.submit(boom)
+        job = await _wait_terminal(reg, job_id)
+
+    assert job["status"] == "error"
+    assert job["error"] == "ValueError: bad codec"  # user-facing message unchanged
+    records = [r for r in caplog.records if r.name == "panoptes.api.jobs"]
+    assert len(records) == 1, "the failed job must log exactly one traceback"
+    record = records[0]
+    assert record.levelname == "ERROR"
+    assert record.exc_info is not None  # logger.exception captured the traceback
+    assert record.exc_info[0] is ValueError
+    assert job_id in record.getMessage()
+
+
 async def test_video_job_rejects_oversized_upload(app_client, tmp_path: Path) -> None:
     client, app = app_client
     blob = b"\x00" * (2 * 1024 * 1024)  # max_upload_mb=1 in test config

@@ -17,12 +17,15 @@ on every ``submit``/``get``.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import Callable
 from typing import Any
 
 __all__ = ["JobRegistry", "ProgressCallback"]
+
+logger = logging.getLogger(__name__)
 
 _TERMINAL_STATUSES = frozenset({"done", "error"})
 
@@ -121,6 +124,9 @@ class JobRegistry:
             try:
                 result = await asyncio.to_thread(fn, progress)
             except Exception as exc:
+                # Keep the concise message for the API; log the traceback
+                # server-side (nothing else in the media-job chain does).
+                logger.exception("media job %s failed", job_id)
                 job["status"] = "error"
                 job["error"] = f"{type(exc).__name__}: {exc}"
             else:
