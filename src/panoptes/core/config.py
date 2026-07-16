@@ -2,9 +2,12 @@
 
 A single YAML file (``panoptes.yaml``) declares detectors, streams,
 calibration, analytics geometry (lines/zones), watchlists and the
-declarative rules DSL. Every field can be overridden via environment
-variables with the ``PANOPTES_`` prefix and ``__`` as nesting delimiter
-(e.g. ``PANOPTES_SERVER__PORT=9000``).
+declarative rules DSL. Any field *absent* from the YAML can be supplied via
+environment variables with the ``PANOPTES_`` prefix and ``__`` as nesting
+delimiter (e.g. ``PANOPTES_SERVER__PORT=9000``). Note the precedence:
+:func:`load_config` passes the YAML as init kwargs, which outrank env vars,
+so a field already set in YAML **silently shadows** its env override rather
+than being overridden by it.
 
 Design rules:
 

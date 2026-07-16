@@ -283,6 +283,7 @@ asyncio.run(main())
 | `stream` | string | Stream id filter |
 | `since` | float | Minimum `wall_ts` (UNIX seconds) |
 | `limit` | int 1–1000 | Page size (default 100) |
+| `offset` | int ≥ 0 | Pagination offset |
 
 ```json
 [
@@ -303,6 +304,55 @@ When `privacy.plate_storage: hashed` is configured, the repository hashes
 `q` with the configured salt before matching, so **exact-match search still
 works** but partial matching does not — and the `plate` field contains the
 hash, not readable text. See [PRIVACY.md](PRIVACY.md).
+
+---
+
+## Tracks
+
+### `GET /api/v1/tracks` — track-summary history
+
+One row per finished track (written on `TRACK_FINISHED`), mirroring the
+storage `tracks` table.
+
+| Param | Type | Meaning |
+|---|---|---|
+| `stream` | string | Stream id filter |
+| `class` | string | Vehicle class filter (`422` on unknown values) |
+| `plate` | string | Plate text, exact match (hashed mode: exact full plate) |
+| `since` | float | Minimum `last_wall_ts` (UNIX seconds) |
+| `limit` | int 1–1000 | Page size (default 100) |
+| `offset` | int ≥ 0 | Pagination offset |
+
+```bash
+curl -H "X-API-Key: KEY" \
+  "http://host:8080/api/v1/tracks?stream=cam-north&class=truck&limit=50"
+```
+
+Returns a JSON array of Track objects:
+
+```json
+[
+  {
+    "stream_id": "cam-north",
+    "track_id": 17,
+    "vehicle_class": "truck",
+    "first_wall_ts": 1783938440.021,
+    "last_wall_ts": 1783938446.512,
+    "duration_s": 6.49,
+    "distance_m": 84.2,
+    "avg_speed_kmh": 46.7,
+    "max_speed_kmh": 58.3,
+    "plate_text": "34ABC123",
+    "plate_confidence": 0.94,
+    "color": "white",
+    "attributes": {}
+  }
+]
+```
+
+When `privacy.plate_storage: hashed` is configured, the repository hashes
+`plate` before matching, so exact full-plate lookup still works while the
+returned `plate_text` field carries the hash. See [PRIVACY.md](PRIVACY.md).
 
 ---
 
