@@ -836,6 +836,9 @@ def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
         assert status["state"] == "ended"
         assert status["frames"] == 60 and status["dropped"] == 0
         assert status["last_error"] is None
+        # The /analytics endpoint + annotate() overlay read status()["analytics"]
+        # off the live processor's AnalyticsEngine summary.
+        assert status["analytics"] == {"lines": {}, "zones": {}}
 
         jpeg = manager.latest_jpeg("s1")
         assert jpeg is not None and jpeg[:2] == b"\xff\xd8"  # JPEG magic
@@ -896,6 +899,57 @@ def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
     assert started.data["source"] == "rtsp://***@10.0.0.5:554/live"
     error = next(e for e in events if e.type is EventType.STREAM_ERROR)
     assert error.data["error"] == "open failed: rtsp://***@10.0.0.5:554/live"
+
+
+def test_stream_worker_status_carries_processor_analytics_summary(
+    tmp_path: Path,
+) -> None:
+    """status() must surface the live AnalyticsEngine summary so the
+    /analytics endpoint and annotate() overlay render real line/zone
+    counters — not the empty dict the fake manager fabricated."""
+    stream = StreamConfig(id="s1", source="stub")
+    config = AppConfig(server=ServerConfig(media_dir=str(tmp_path / "media")))
+    worker = StreamWorker(stream, config, scheduler=None, bus=EventBus(), media_dir=tmp_path)
+
+    # No processor yet (created/idle): analytics is the empty dict.
+    assert worker.status()["analytics"] == {}
+
+    # A running processor: its summary() flows through unmodified. A distinct
+    # payload guards against a hardcoded {} passing the assertion.
+    summary = {"lines": {"main": {"forward": {"car": 3}}}, "zones": {}}
+    worker._processor = types.SimpleNamespace(  # type: ignore[assignment]
+        frames_processed=7,
+        frames_dropped=1,
+        active_track_count=2,
+        summary=lambda: summary,
+    )
+    assert worker.status()["analytics"] == summary
+
+
+def test_stream_worker_failure_logs_scrubbed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A crashed worker must be visible in server logs, but the log line
+    must carry the credential-scrubbed message only — never a live
+    traceback embedding the raw rtsp ``user:pass@`` URL (CWE-532)."""
+    source = "rtsp://admin:S3cr3t!@10.0.0.5:554/live"
+    stream = StreamConfig(id="s1", source=source)
+    config = AppConfig(server=ServerConfig(media_dir=str(tmp_path / "media")))
+
+    def _boom(cfg):
+        raise RuntimeError(f"open failed: {source}")
+
+    monkeypatch.setattr("panoptes.pipeline.worker.open_source", _boom, raising=True)
+
+    worker = StreamWorker(stream, config, scheduler=None, bus=EventBus(), media_dir=tmp_path)
+    with caplog.at_level(logging.ERROR, logger="panoptes.pipeline.worker"):
+        worker.start()
+        wait_for(lambda: worker.status()["state"] == "error", message="error state")
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "s1" in errors[0].message
+    assert "S3cr3t" not in errors[0].message and "admin:" not in errors[0].message
 
 
 def test_manager_status_lists_idle_streams(tmp_path: Path):

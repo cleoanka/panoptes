@@ -310,6 +310,9 @@ class StreamWorker:
             "frames": proc.frames_processed if proc else 0,
             "dropped": proc.frames_dropped if proc else 0,
             "active_tracks": proc.active_track_count if proc else 0,
+            # AnalyticsEngine line/zone counters; the /analytics endpoint and
+            # the annotate() overlay read this key off PipelineManager.status().
+            "analytics": proc.summary() if proc else {},
             "last_error": self._last_error,
         }
 
@@ -368,6 +371,11 @@ class StreamWorker:
         message = self._scrub_error(message)
         self._last_error = message
         self._state = "error"
+        # A crashed worker (source open, decode, inference, ALPR/attributes)
+        # is otherwise invisible in server logs. Log the credential-scrubbed
+        # message only — live exc_info would render an unscrubbed traceback
+        # carrying the raw ``user:pass@`` source URL (CWE-532).
+        logger.error("stream '%s' failed: %s", self._stream_cfg.id, message)
         self._publish_lifecycle(EventType.STREAM_ERROR, {"error": message})
 
     def _on_source_error(self, message: str) -> None:
