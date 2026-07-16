@@ -207,6 +207,52 @@ def test_fusion_forget_resets_evidence() -> None:
     assert (attr.value, attr.n_observations) == ("green", 1)
 
 
+def test_fusion_tie_breaks_by_value_not_arrival_order() -> None:
+    # Exact cumulative-mass tie: {'red': 0.5, 'blue': 0.5}. Bare max() would
+    # let whichever value arrived first win, so the same multiset fed in two
+    # orders emitted two different colors. The fix breaks the tie on the lower
+    # value string ('blue' < 'red'), independent of arrival order.
+    observations = [("red", 0.5), ("blue", 0.5)]
+
+    def fuse(order: list[tuple[str, float]]) -> str:
+        fuser = AttributeFuser()
+        track = make_track()
+        for value, confidence in order:
+            fuser.observe(track, "color", value, confidence)
+        return track.attributes["color"].value
+
+    assert fuse(observations) == fuse(list(reversed(observations))) == "blue"
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_fusion_stable_under_observation_permutation(seed: int) -> None:
+    # Property: the fused value and confidence are a function of the observation
+    # *multiset* alone — permuting arrival order must not change either. Coarse
+    # confidences deliberately provoke exact-mass ties across two values, the
+    # invariant whose absence hid the arrival-order tie bug above.
+    rng = np.random.default_rng(seed)
+    observations: list[tuple[str, float]] = [
+        (str(rng.choice(["toyota", "honda"])), float(rng.choice([0.35, 0.5, 0.7])))
+        for _ in range(int(rng.integers(3, 8)))
+    ]
+
+    def fuse(order: list[tuple[str, float]]) -> tuple[str, float]:
+        fuser = AttributeFuser()
+        track = make_track()
+        for value, confidence in order:
+            fuser.observe(track, "make_model", value, confidence)
+        attr = track.attributes["make_model"]
+        return attr.value, attr.confidence
+
+    shuffled = list(observations)
+    rng.shuffle(shuffled)
+    value, confidence = fuse(shuffled)
+    ref_value, ref_confidence = fuse(observations)
+    # Value is exactly invariant; confidence up to float summation-order rounding.
+    assert value == ref_value
+    assert confidence == pytest.approx(ref_confidence)
+
+
 # ---------------------------------------------------------------------
 # Pipeline: cadence, active-only, forgetting
 # ---------------------------------------------------------------------

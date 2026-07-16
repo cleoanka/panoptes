@@ -44,7 +44,12 @@ class AttributeFuser:
         evidence[value] = evidence.get(value, 0.0) + confidence
         self._observations[state_key] = self._observations.get(state_key, 0) + 1
 
-        winner, winner_mass = max(evidence.items(), key=lambda item: item[1])
+        # Highest mass, then lowest value string: a deterministic, arrival-order
+        # independent tie-break (bare ``max`` would pick the first-inserted key,
+        # i.e. whichever value happened to be observed first), mirroring the ALPR
+        # voter's per-slot rule so identical evidence multisets fuse identically.
+        winner = min(evidence, key=lambda value: (-evidence[value], value))
+        winner_mass = evidence[winner]
         total_mass = sum(evidence.values())
         track.attributes[key] = AttributeValue(
             value=winner,
