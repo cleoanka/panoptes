@@ -801,18 +801,22 @@ async def test_tracks_empty_list(app_client) -> None:
 async def test_tracks_query_params_forwarded(app_client) -> None:
     client, app = app_client
     repo = app.state.panoptes.db.tracks
+    # Use the REAL TrackRow.to_dict() key shape: it emits "class"/"plate" (the
+    # TRACK_FINISHED payload contract), NOT the column names. A prior version of
+    # this test used vehicle_class/plate_text and so masked that TrackOut dropped
+    # both fields for every DB-backed row.
     repo.rows = [
         {
             "stream_id": "cam1",
             "track_id": 7,
-            "vehicle_class": "car",
+            "class": "car",
             "first_wall_ts": 1.0,
             "last_wall_ts": 2.0,
             "duration_s": 1.0,
             "distance_m": 12.5,
             "avg_speed_kmh": 45.0,
             "max_speed_kmh": 60.0,
-            "plate_text": "34ABC123",
+            "plate": "34ABC123",
             "plate_confidence": 0.93,
         }
     ]
@@ -840,6 +844,10 @@ async def test_tracks_query_params_forwarded(app_client) -> None:
     (row,) = resp.json()
     assert row["track_id"] == 7
     assert row["avg_speed_kmh"] == 45.0
+    # The class/plate keys from the repo dict must reach the wire fields (these
+    # were silently null before TrackOut aliased them).
+    assert row["vehicle_class"] == "car"
+    assert row["plate_text"] == "34ABC123"
 
 
 async def test_tracks_invalid_class_filter(app_client) -> None:

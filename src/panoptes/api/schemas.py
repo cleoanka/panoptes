@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from panoptes.core.config import AppConfig
 from panoptes.core.events import EventType
@@ -104,20 +104,32 @@ class EventOut(BaseModel):
 
 
 class TrackOut(BaseModel):
-    """Mirror of the storage ``tracks`` table (track summaries)."""
+    """Mirror of the storage ``tracks`` table (track summaries).
 
-    model_config = ConfigDict(from_attributes=True)
+    ``TrackRow.to_dict()`` follows the TRACK_FINISHED payload contract and emits
+    ``class``/``plate`` (not the column names). Those two fields use a
+    *validation* alias (``AliasChoices`` accepts either the payload key or the
+    Python name) so the repo dict populates them — while serialization keeps the
+    field name, so the wire shape stays ``vehicle_class``/``plate_text`` regardless
+    of FastAPI's by-alias response default.
+    """
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     stream_id: str
     track_id: int
-    vehicle_class: str | None = None
+    vehicle_class: str | None = Field(
+        default=None, validation_alias=AliasChoices("class", "vehicle_class")
+    )
     first_wall_ts: float | None = None
     last_wall_ts: float | None = None
     duration_s: float | None = None
     distance_m: float | None = None
     avg_speed_kmh: float | None = None
     max_speed_kmh: float | None = None
-    plate_text: str | None = None
+    plate_text: str | None = Field(
+        default=None, validation_alias=AliasChoices("plate", "plate_text")
+    )
     plate_confidence: float | None = None
     color: str | None = None
     attributes: dict[str, Any] = Field(default_factory=dict)
