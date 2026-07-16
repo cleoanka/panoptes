@@ -940,6 +940,65 @@ async def test_video_job_rejects_oversized_upload(app_client, tmp_path: Path) ->
     assert not list(upload_dir.glob("*")), "partial upload not cleaned up"
 
 
+async def test_video_job_hashed_mode_redacts_plate(app_client) -> None:
+    # privacy.plate_storage="hashed" (test config): the batch job result must
+    # carry the digest, never the readable plate — the batch path collects raw
+    # events and would otherwise leak plates that the SSE/WS feeds hash out
+    # (docs/PRIVACY.md promise). tracks carry the plate at the top level,
+    # events carry it inside data; both must go out hashed.
+    client, app = app_client
+    jobs = app.state.panoptes.jobs
+    db = app.state.panoptes.db
+
+    def run(progress_cb: Any) -> dict[str, Any]:
+        return {
+            "tracks": [{"track_id": 7, "plate": RAW_PLATE, "valid": True}],
+            "events": [_plate_event().to_dict()],
+            "frames": 1,
+        }
+
+    job_id = jobs.submit(run)
+    with anyio.fail_after(10):
+        while True:
+            body = (await client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)).json()
+            if body["status"] in ("done", "error"):
+                break
+            await asyncio.sleep(0.05)
+
+    assert body["status"] == "done", body
+    resp = await client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)
+    assert RAW_PLATE not in resp.text
+    result = resp.json()["result"]
+    hashed = db.hash_plate(RAW_PLATE)
+    assert result["tracks"][0]["plate"] == hashed
+    assert result["tracks"][0]["valid"] is True  # non-plate keys untouched
+    assert result["events"][0]["data"]["plate"] == hashed
+
+
+async def test_video_job_plain_mode_keeps_readable_plate(fakes: None, tmp_path: Path) -> None:
+    # Plain mode is a passthrough: the batch result keeps readable plates,
+    # mirroring the SSE/WS feeds (no hashing when plate_storage="plain").
+    app = create_app(make_config(tmp_path, plate_storage="plain"))
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            jobs = app.state.panoptes.jobs
+
+            def run(progress_cb: Any) -> dict[str, Any]:
+                return {"tracks": [{"track_id": 7, "plate": RAW_PLATE}], "events": []}
+
+            job_id = jobs.submit(run)
+            with anyio.fail_after(10):
+                while True:
+                    body = (await client.get(f"/api/v1/jobs/{job_id}", headers=AUTH)).json()
+                    if body["status"] in ("done", "error"):
+                        break
+                    await asyncio.sleep(0.05)
+
+    assert body["status"] == "done", body
+    assert body["result"]["tracks"][0]["plate"] == RAW_PLATE
+
+
 async def test_job_not_found(app_client) -> None:
     client, _app = app_client
     assert (await client.get("/api/v1/jobs/nope", headers=AUTH)).status_code == 404
