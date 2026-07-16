@@ -50,6 +50,7 @@ from panoptes.pipeline.governor import FrameGovernor
 from panoptes.pipeline.scheduler import _SENTINEL, InferenceScheduler
 from panoptes.pipeline.snapshots import SnapshotSaver
 from panoptes.pipeline.source import OpenCvSource, PyAvSource, open_source
+from panoptes.pipeline.worker import StreamWorker
 
 # ---------------------------------------------------------------------
 # helpers / fakes
@@ -755,6 +756,59 @@ def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
     finally:
         manager.stop()
     _assert_no_leaked_threads(before)
+
+
+def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_components
+):
+    # RTSP/HTTP sources routinely embed credentials; they must never reach
+    # STREAM_STARTED / STREAM_ERROR event data (feeds, DB, webhooks are sinks).
+    source = "rtsp://admin:S3cr3t!@10.0.0.5:554/live"
+    stream = StreamConfig(id="s1", source=source)
+    config = AppConfig(server=ServerConfig(media_dir=str(tmp_path / "media")))
+    bus = EventBus()
+    events: list[Event] = []
+    bus.add_handler(events.append)
+
+    # Fake source that ends immediately: drives _run() past STREAM_STARTED
+    # (a real rtsp open would block); the raw URL never touches the network.
+    class _EmptySource:
+        def __init__(self) -> None:
+            self.error_cb = None
+
+        def __iter__(self):
+            return iter(())
+
+        def close(self) -> None:
+            pass
+
+        def request_stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "panoptes.pipeline.worker.open_source", lambda cfg: _EmptySource(), raising=True
+    )
+
+    worker = StreamWorker(stream, config, scheduler=None, bus=bus, media_dir=tmp_path)
+    worker.start()
+    wait_for(
+        lambda: any(e.type is EventType.STREAM_ENDED for e in list(events)),
+        message="STREAM_ENDED",
+    )
+
+    # STREAM_ERROR messages embed the raw source URL mid-string (source.py).
+    worker._on_source_error(f"open failed: {source}")
+    worker._fail(f"read failed: {source}")
+
+    for event in events:
+        blob = repr(event.data)
+        assert "S3cr3t" not in blob and "admin:" not in blob, blob
+    assert "S3cr3t" not in (worker.status()["last_error"] or "")
+
+    started = next(e for e in events if e.type is EventType.STREAM_STARTED)
+    assert started.data["source"] == "rtsp://***@10.0.0.5:554/live"
+    error = next(e for e in events if e.type is EventType.STREAM_ERROR)
+    assert error.data["error"] == "open failed: rtsp://***@10.0.0.5:554/live"
 
 
 def test_manager_status_lists_idle_streams(tmp_path: Path):

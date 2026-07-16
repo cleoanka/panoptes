@@ -19,6 +19,7 @@ and the modules can be substituted in tests.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -48,6 +49,21 @@ logger = logging.getLogger(__name__)
 _JPEG_REFRESH_MIN_INTERVAL_S = 0.1  # latest_jpeg refreshed at most 10/s
 _FPS_WINDOW_S = 2.0                 # rolling FPS horizon for status()
 _STOP_JOIN_TIMEOUT_S = 10.0
+
+# RTSP/HTTP camera sources routinely embed credentials (rtsp://user:pass@host),
+# so mask them before a source URL enters lifecycle-event data — those events
+# reach the live feeds, the DB and webhooks unredacted. Mirrors
+# ``panoptes.api.schemas.scrub_url`` (kept local to keep this module free of
+# the api/FastAPI import chain).
+_USERINFO_RE = re.compile(r"^(\w[\w+.-]*://)([^/]+)@([^@/]*.*)$")
+
+
+def scrub_url(url: str) -> str:
+    """Mask ``user:password@`` credentials embedded in a URL."""
+    match = _USERINFO_RE.match(url)
+    if match:
+        return f"{match.group(1)}***@{match.group(3)}"
+    return url
 
 
 @dataclass(slots=True)
@@ -311,7 +327,9 @@ class StreamWorker:
             return
 
         self._state = "running"
-        self._publish_lifecycle(EventType.STREAM_STARTED, {"source": self._stream_cfg.source})
+        self._publish_lifecycle(
+            EventType.STREAM_STARTED, {"source": scrub_url(self._stream_cfg.source)}
+        )
         reason = "eof"
         try:
             for packet in source:
@@ -347,6 +365,7 @@ class StreamWorker:
         self._publish_lifecycle(EventType.STREAM_ENDED, {"reason": reason})
 
     def _fail(self, message: str) -> None:
+        message = self._scrub_error(message)
         self._last_error = message
         self._state = "error"
         self._publish_lifecycle(EventType.STREAM_ERROR, {"error": message})
@@ -354,8 +373,17 @@ class StreamWorker:
     def _on_source_error(self, message: str) -> None:
         # Called from the worker thread inside the source's reconnect loop;
         # backoff (1s -> 30s) naturally rate-limits these events.
+        message = self._scrub_error(message)
         self._last_error = message
         self._publish_lifecycle(EventType.STREAM_ERROR, {"error": message, "reconnecting": True})
+
+    def _scrub_error(self, message: str) -> str:
+        # source.py error messages embed the raw source URL mid-string
+        # (e.g. "open failed: rtsp://user:pass@host"); ``scrub_url`` is anchored
+        # so replace the known credentialed source with its masked form instead.
+        source = self._stream_cfg.source
+        scrubbed = scrub_url(source)
+        return message.replace(source, scrubbed) if scrubbed != source else message
 
     def _publish_lifecycle(self, event_type: EventType, data: dict[str, Any]) -> None:
         proc = self._processor
