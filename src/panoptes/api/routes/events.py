@@ -87,8 +87,15 @@ async def list_events(
     stream: str | None = Query(None, description="stream id filter"),
     type_: str | None = Query(None, alias="type", description="event type filter"),
     vehicle_class: str | None = Query(None, alias="class", description="vehicle class filter"),
-    since: float | None = Query(None, description="minimum wall_ts (UNIX seconds)"),
-    until: float | None = Query(None, description="maximum wall_ts (UNIX seconds)"),
+    # Reject NaN/Infinity: Pydantic defaults allow_inf_nan=True, but a non-finite
+    # bound reaches the repo as ``WHERE wall_ts >= NaN`` which matches nothing
+    # (NaN comparisons are always False), silently returning an empty history.
+    since: float | None = Query(
+        None, description="minimum wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
+    until: float | None = Query(
+        None, description="maximum wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list[EventOut]:

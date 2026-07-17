@@ -616,6 +616,27 @@ async def test_events_invalid_filters(app_client) -> None:
     ).status_code == 422
 
 
+@pytest.mark.parametrize("bound", ["since", "until"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "Infinity", "1e400"])
+async def test_events_reject_non_finite_bounds(app_client, bound: str, value: str) -> None:
+    # NaN/Infinity bounds would reach the repo as ``WHERE wall_ts >= NaN`` and
+    # match nothing, silently returning an empty history — reject with 422.
+    client, _app = app_client
+    resp = await client.get("/api/v1/events", params={bound: value}, headers=AUTH)
+    assert resp.status_code == 422
+
+
+async def test_events_accept_finite_bounds(app_client) -> None:
+    # The finiteness guard must not reject legitimate finite bounds (incl. omitted).
+    client, _app = app_client
+    assert (
+        await client.get(
+            "/api/v1/events", params={"since": 1.5, "until": 9.0}, headers=AUTH
+        )
+    ).status_code == 200
+    assert (await client.get("/api/v1/events", headers=AUTH)).status_code == 200
+
+
 async def test_sse_stream_delivers_published_event(app_client) -> None:
     client, app = app_client
     bus = app.state.panoptes.bus
