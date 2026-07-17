@@ -122,8 +122,10 @@ How to read the number:
   nothing about your tape measure. This is why 6–8 points are worth the
   extra survey effort.
 - **More than 4 points:** the residual now *exposes* measurement error.
-  As a rule of thumb, keep it **below ~2–3 px** at 1280-wide frames;
-  10+ px means a mislabeled point or a wrong distance.
+  The command applies a hard **2.0 px** pass/fail threshold at 1280-wide
+  frames: a mean error above 2 px prints `FAIL` and exits non-zero
+  (so it can gate CI/scripts), at or below prints `OK`. Aim well under
+  2 px; 10+ px means a mislabeled point or a wrong distance.
 - An exception (`CalibrationError`) means a degenerate configuration —
   see Limits.
 

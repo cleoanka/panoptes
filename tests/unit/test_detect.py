@@ -82,6 +82,41 @@ class TestRegistry:
         with pytest.raises(BackendUnavailableError, match="cuda-python"):
             create_detector(DetectorConfig(backend="tensorrt", model="model.engine"))
 
+    def _install_fake_tensorrt_runtime(self, monkeypatch, recorder: dict) -> None:
+        """Fake ``tensorrt`` + ``cuda.bindings.runtime`` reaching just past the
+        ``cudaSetDevice`` call (the engine-file check then aborts __init__)."""
+        monkeypatch.setitem(sys.modules, "tensorrt", types.ModuleType("tensorrt"))
+        cuda = types.ModuleType("cuda")
+        bindings = types.ModuleType("cuda.bindings")
+        runtime = types.ModuleType("cuda.bindings.runtime")
+
+        def cudaSetDevice(device_id):
+            recorder["set_device"] = device_id
+            return (0,)
+
+        runtime.cudaSetDevice = cudaSetDevice
+        cuda.bindings = bindings  # type: ignore[attr-defined]
+        bindings.runtime = runtime  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "cuda", cuda)
+        monkeypatch.setitem(sys.modules, "cuda.bindings", bindings)
+        monkeypatch.setitem(sys.modules, "cuda.bindings.runtime", runtime)
+
+    def test_tensorrt_cuda_device_selected(self, monkeypatch):
+        recorder: dict = {}
+        self._install_fake_tensorrt_runtime(monkeypatch, recorder)
+        # cudaSetDevice runs before the engine-file check, so a missing file
+        # still exercises the device-selection path.
+        with pytest.raises(ConfigError, match="not found"):
+            create_detector(DetectorConfig(backend="tensorrt", model="absent.engine", device="cuda:1"))
+        assert recorder["set_device"] == 1
+
+    def test_tensorrt_auto_device_not_selected(self, monkeypatch):
+        recorder: dict = {}
+        self._install_fake_tensorrt_runtime(monkeypatch, recorder)
+        with pytest.raises(ConfigError, match="not found"):
+            create_detector(DetectorConfig(backend="tensorrt", model="absent.engine", device="auto"))
+        assert "set_device" not in recorder
+
 
 # ---------------------------------------------------------------------
 # mock backend
@@ -377,6 +412,18 @@ class TestDecodeClassic:
         with pytest.raises(ValueError):
             decode_classic(np.zeros((84, 100)), conf=0.5, iou=0.5)
 
+    def test_caps_after_nms_to_max_det(self):
+        # Disjoint per-class boxes survive NMS untouched; the symmetric cap
+        # must still bound the returned count to max_det.
+        n = 400
+        out = np.zeros((1, 84, n), dtype=np.float32)
+        for column in range(n):
+            out[0, :4, column] = [15 * column, 15 * column, 10, 10]  # disjoint
+            out[0, 4 + (column % 80), column] = 0.5 + column / (2 * n)
+        (xyxy, scores, _class_ids), = decode_classic(out, conf=0.25, iou=0.5)
+        assert len(xyxy) == 300
+        assert scores.min() >= 0.5 + (n - 300) / (2 * n)
+
 
 class TestParseE2E:
     def test_extracts_rows_above_conf(self):
@@ -395,6 +442,21 @@ class TestParseE2E:
     def test_rejects_wrong_last_dim(self):
         with pytest.raises(ValueError):
             parse_e2e(np.zeros((1, 300, 5)), conf=0.25)
+
+    def test_caps_oversized_output_to_max_det(self):
+        # A misconfigured/adversarial export can emit far more rows than the
+        # standard (B, 300, 6) contract; the cap must stop the flood and keep
+        # the highest-scoring detections.
+        n = 50_000
+        output = np.zeros((1, n, 6), dtype=np.float32)
+        output[0, :, :4] = [10, 20, 110, 120]
+        output[0, :, 4] = np.linspace(0.5, 0.9, n)  # ascending, all above conf
+        output[0, :, 5] = 2
+        (xyxy, scores, _class_ids), = parse_e2e(output, conf=0.25)
+        assert len(xyxy) == 300
+        # Kept the top-300 by score (the tail of the ascending ramp).
+        threshold = np.float32(np.linspace(0.5, 0.9, n)[-300])
+        assert scores.min() >= threshold
 
 
 # ---------------------------------------------------------------------
@@ -442,6 +504,26 @@ class TestBuildDetections:
             mock_config(), self.FRAME_SHAPE,
         )
         assert detections == []
+
+    def test_non_finite_boxes_dropped(self):
+        # A malformed/adversarial model emitting NaN/inf coords must be
+        # filtered, not crash the downstream (int(nan) raises ValueError).
+        xyxy = np.array(
+            [
+                [10, 20, 110, 120],           # car — clean, kept
+                [np.nan, 20, 110, 120],        # car — NaN x1, dropped
+                [10, np.inf, 110, 120],        # car — inf y1, dropped
+                [10, 20, 110, -np.inf],        # car — -inf y2, dropped
+            ],
+            dtype=np.float64,
+        )
+        scores = np.array([0.9, 0.9, 0.9, 0.9])
+        class_ids = np.array([2, 2, 2, 2])
+        detections = build_detections(
+            xyxy, scores, class_ids, COCO80_NAMES, mock_config(conf=0.25), self.FRAME_SHAPE
+        )
+        assert [d.vehicle_class for d in detections] == [VehicleClass.CAR]
+        assert detections[0].bbox.to_xyxy() == (10.0, 20.0, 110.0, 120.0)
 
 
 class TestClassTables:
@@ -626,6 +708,33 @@ class TestRFDetrBackend:
         assert len(results) == 3
         assert len(recorder["images"]) == 3
 
+    def test_auto_device_not_passed_to_constructor(self, monkeypatch):
+        recorder: dict = {}
+        install_fake_rfdetr(monkeypatch, recorder)
+        create_detector(DetectorConfig(backend="rfdetr", model="rfdetr-medium"))
+        assert "device" not in recorder["init_kwargs"]
+
+    def test_explicit_device_passed_to_constructor(self, monkeypatch):
+        recorder: dict = {}
+        install_fake_rfdetr(monkeypatch, recorder)
+        create_detector(
+            DetectorConfig(backend="rfdetr", model="rfdetr-medium", device="cuda:0")
+        )
+        assert recorder["init_kwargs"]["device"] == "cuda:0"
+
+    def test_explicit_rfdetr_kwargs_device_wins(self, monkeypatch):
+        recorder: dict = {}
+        install_fake_rfdetr(monkeypatch, recorder)
+        create_detector(
+            DetectorConfig(
+                backend="rfdetr",
+                model="rfdetr-medium",
+                device="cuda:0",
+                extra={"rfdetr_kwargs": {"device": "cpu"}},
+            )
+        )
+        assert recorder["init_kwargs"]["device"] == "cpu"
+
     @pytest.mark.parametrize("model", ["rfdetr-xl", "rfdetr-2xl", "RFDETR_XL"])
     def test_pml_licensed_tiers_rejected(self, model):
         # No fake module needed: the license gate fires before the import.
@@ -763,6 +872,15 @@ class TestOnnxBackend:
         with pytest.raises(ConfigError, match="not found"):
             create_detector(config)
 
+    def test_extra_names_non_int_keys_falls_back_to_coco80(self, monkeypatch, tmp_path):
+        # YAML mappings arrive with string keys; a non-int-coercible key in
+        # config.extra["names"] must fall back, not crash detector construction
+        recorder: dict = {}
+        install_fake_onnxruntime(monkeypatch, recorder, np.zeros((1, 300, 6), np.float32))
+        config = self.onnx_config(tmp_path, extra={"names": {"car": "vehicle"}})
+        detector = create_detector(config)
+        assert detector._names == COCO80_NAMES
+
 
 class TestParseNamesMetadata:
     def test_dict_literal(self):
@@ -777,3 +895,10 @@ class TestParseNamesMetadata:
 
     def test_garbage_falls_back_to_coco80(self):
         assert parse_names_metadata("not a dict at all {{{") == COCO80_NAMES
+
+    def test_dict_with_non_int_keys_falls_back_to_coco80(self):
+        # a parseable dict whose keys aren't int-coercible must honour the
+        # documented fallback, not escape with a raw ValueError/TypeError
+        assert parse_names_metadata("{'car': 'vehicle'}") == COCO80_NAMES
+        assert parse_names_metadata("{None: 1}") == COCO80_NAMES
+        assert parse_names_metadata("{(1, 2): 'x'}") == COCO80_NAMES

@@ -7,6 +7,7 @@ stream. All public methods are safe to call from ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import logging
 import threading
 import time
 from collections.abc import Callable
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
 
 __all__ = ["PipelineManager"]
 
+logger = logging.getLogger(__name__)
+
 _PROGRESS_EVERY_N_FRAMES = 5
 
 
@@ -43,6 +46,9 @@ class PipelineManager:
         self._stopping: set[str] = set()
         self._scheduler: InferenceScheduler | None = None
         self._detector: Detector | None = None
+        # Latched by stop(): a start racing an in-progress stop() must not
+        # resurrect a fresh scheduler/detector/worker that stop() never sees.
+        self._stopped = False
         self._lock = threading.RLock()
 
     # -- shared inference -----------------------------------------------
@@ -72,6 +78,11 @@ class PipelineManager:
     def stop(self) -> None:
         """Stop all workers, then tear down the shared scheduler/detector."""
         with self._lock:
+            # Latch stopped under the lock: worker.stop() joins up to seconds
+            # outside the lock, so a concurrent start_stream() that acquires
+            # the lock in that window must see this and no-op rather than
+            # rebuild a scheduler/detector/worker this teardown never captured.
+            self._stopped = True
             workers = list(self._workers.values())
             scheduler = self._scheduler
             detector = self._detector
@@ -94,6 +105,10 @@ class PipelineManager:
         """
         cfg = self._config.stream(stream_id)  # raises ConfigError when unknown
         with self._lock:
+            if self._stopped:
+                # Manager has been stopped: a start racing that teardown must
+                # not resurrect and leak a scheduler/detector/worker.
+                return
             existing = self._workers.get(stream_id)
             if existing is not None and existing.is_alive:
                 if stream_id in self._stopping:
@@ -209,6 +224,7 @@ class PipelineManager:
                     progress_cb(min(0.99, processor.frames_seen / source.frame_count))
             processor.finalize(time.time())
         finally:
+            self._release_processor(processor)
             source.close()
             if writer is not None:
                 writer.release()
@@ -231,6 +247,41 @@ class PipelineManager:
         }
 
     @staticmethod
+    def _release_processor(processor: StreamProcessor) -> None:
+        """Release a batch processor's per-stream model sessions.
+
+        The ALPR detector/OCR and attribute extractors each hold native
+        (and CoreML/CUDA) onnxruntime sessions; dropping the processor
+        alone defers their release to GC. Free them eagerly so restarted
+        jobs don't pile sessions up.
+
+        The attribute pipeline exposes ``close()``; the ALPR pipeline has
+        no such hook, so its detector/OCR model references (``_detector``/
+        ``_ocr``) are dropped directly to make those sessions GC-eligible.
+        Every release is optional and guarded — a fake or a degraded
+        (extra-not-installed) stage may lack the hook/attributes, and one
+        failing must not mask the others.
+        """
+        for stage in (
+            getattr(processor, "_attributes", None),
+            getattr(processor, "_alpr", None),
+        ):
+            if stage is None:
+                continue
+            try:
+                close = getattr(stage, "close", None)
+                if close is not None:
+                    close()
+                # ALPR has no close(): drop the onnxruntime-backed model refs
+                for attr in ("_detector", "_ocr"):
+                    if hasattr(stage, attr):
+                        setattr(stage, attr, None)
+            except Exception as exc:  # best-effort teardown: one failure must not mask the rest
+                logger.warning(
+                    "error releasing model session on %s: %s", type(stage).__name__, exc
+                )
+
+    @staticmethod
     def _open_writer(
         annotated_path: str | Path | None,
         fps: float | None,
@@ -249,5 +300,10 @@ class PipelineManager:
         )
         if not writer.isOpened():  # degrade: results still returned without video
             writer.release()
+            logger.warning(
+                "annotated video writer failed to open at %s (codec/path?); "
+                "returning results without annotated video",
+                out,
+            )
             return None, None
         return writer, str(out)

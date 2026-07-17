@@ -28,6 +28,7 @@ from panoptes.detect._postprocess import (
     preprocess_batch,
 )
 from panoptes.detect.base import Detector
+from panoptes.detect.onnx_backend import _coerce_names
 
 __all__ = ["TensorRTDetector"]
 
@@ -55,6 +56,14 @@ class TensorRTDetector(Detector):
         except ImportError as exc:
             raise BackendUnavailableError("tensorrt", _HINT) from exc
         self._cudart = _import_cudart()
+        # Bind this backend to a specific GPU before any stream/buffer
+        # allocation so they land on the requested device. "auto"/"cpu"
+        # leave the CUDA default (device 0); "mps" is meaningless here.
+        # config.half (FP16) is not honoured at load time: engine precision
+        # is baked in at export (panoptes export --format engine --half).
+        if config.device.startswith("cuda"):
+            device_id = int(config.device.split(":", 1)[1]) if ":" in config.device else 0
+            self._check(self._cudart.cudaSetDevice(device_id))
         engine_path = Path(config.model)
         if not engine_path.exists():
             raise ConfigError(f"tensorrt engine file not found: {engine_path}")
@@ -85,7 +94,7 @@ class TensorRTDetector(Detector):
         self._output_dtype = self._np_dtype(engine.get_tensor_dtype(self._output_name))
         extra_names = config.extra.get("names")
         if isinstance(extra_names, dict):
-            self._names: dict[int, str] = {int(k): str(v) for k, v in extra_names.items()}
+            self._names: dict[int, str] = _coerce_names(extra_names)
         else:
             self._names = dict(COCO80_NAMES)
         self._buffers: dict[str, tuple[int, int]] = {}  # key -> (device ptr, capacity)

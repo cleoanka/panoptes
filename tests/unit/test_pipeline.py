@@ -9,9 +9,11 @@ runtime is ever imported.
 from __future__ import annotations
 
 import itertools
+import logging
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import cv2
@@ -44,12 +46,14 @@ from panoptes.core.types import (
     TrackState,
     VehicleClass,
 )
+from panoptes.observability import metrics
 from panoptes.pipeline import PipelineManager
 from panoptes.pipeline.annotate import annotate
 from panoptes.pipeline.governor import FrameGovernor
-from panoptes.pipeline.scheduler import InferenceScheduler
+from panoptes.pipeline.scheduler import _SENTINEL, InferenceScheduler
 from panoptes.pipeline.snapshots import SnapshotSaver
 from panoptes.pipeline.source import OpenCvSource, PyAvSource, open_source
+from panoptes.pipeline.worker import StreamWorker, _stream_labelled_collectors
 
 # ---------------------------------------------------------------------
 # helpers / fakes
@@ -397,6 +401,36 @@ def test_scheduler_propagates_detector_error_to_all_futures():
         scheduler.close()
 
 
+def test_scheduler_logs_detector_failure_at_origin(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A detector failure must be logged once at its origin (the inference
+    thread) with a traceback — otherwise it is invisible operator-side, since
+    the exception only surfaces where a future is awaited."""
+    detector = GateDetector(fail_after_gate=True)
+    scheduler = InferenceScheduler(detector, max_batch=8, max_delay_ms=20)
+    try:
+        sacrificial = threading.Thread(target=scheduler.infer, args=(_marked_frame(1),))
+        sacrificial.start()
+        wait_for(detector.first_call_seen.is_set, message="first batch pickup")
+
+        racer = scheduler.submit(_marked_frame(7))
+        wait_for(lambda: scheduler._queue.qsize() >= 1, message="queued submission")
+        with caplog.at_level(logging.ERROR, logger="panoptes.pipeline.scheduler"):
+            detector.gate.set()
+            sacrificial.join(5.0)
+            with pytest.raises(RuntimeError, match="boom"):
+                racer.result(5.0)
+    finally:
+        scheduler.close()
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "detector batch" in errors[0].message
+    # the traceback is captured (logger.exception), not just the message
+    assert errors[0].exc_info is not None
+
+
 def test_scheduler_close_drains_and_rejects_new_work():
     class SlowDetector:
         def infer(self, frames):
@@ -412,6 +446,136 @@ def test_scheduler_close_drains_and_rejects_new_work():
         future.result()  # drained batches resolve normally
     with pytest.raises(RuntimeError):
         scheduler.infer(_marked_frame(0))
+
+
+def test_scheduler_submit_racing_close_never_orphans_future():
+    """A submit that reaches put() as close() runs must not leave a future
+    pending (which would hang the worker on .result() forever)."""
+
+    class SlowDetector:
+        def infer(self, frames):
+            time.sleep(0.01)
+            return [[] for _ in frames]
+
+    scheduler = InferenceScheduler(SlowDetector(), max_batch=4, max_delay_ms=5)
+    real_put = scheduler._queue.put
+    closing = threading.Thread(target=scheduler.close)
+    triggered = threading.Event()
+
+    def racing_put(item, *args, **kwargs):
+        # Only meddle with real submissions (frame, future), not the sentinel.
+        if not triggered.is_set() and item is not _SENTINEL:
+            triggered.set()
+            # Start close() concurrently the instant this submit is enqueuing,
+            # then give it time to flip _closed, join and drain. Without locking
+            # the check+put, this put lands behind a fully drained queue.
+            closing.start()
+            time.sleep(0.05)
+        return real_put(item, *args, **kwargs)
+
+    scheduler._queue.put = racing_put  # type: ignore[method-assign]
+    future = scheduler.submit(_marked_frame(1))
+    wait_for(triggered.is_set, message="racing submit reached put")
+    closing.join(5.0)
+    assert not closing.is_alive()
+    assert not scheduler._thread.is_alive()
+    # The future is settled one way or another (drained normally or failed) —
+    # never orphaned, which is the only outcome that would hang the worker.
+    assert future.done()
+    assert future.exception(timeout=0) is None or isinstance(
+        future.exception(timeout=0), RuntimeError
+    )
+
+
+def test_scheduler_close_leaves_queue_to_thread_when_join_times_out():
+    """A detector wedged past the join timeout must stay the sole queue
+    consumer: close() must not drain (and swallow the sentinel) while the
+    scheduler thread is still alive, or that thread blocks on get() forever."""
+    detector = GateDetector()
+    scheduler = InferenceScheduler(detector, max_batch=8, max_delay_ms=20)
+    real_join = scheduler._thread.join
+    try:
+        # Wedge the scheduler thread inside the first infer() (gate never set
+        # before close), then pile a submission up behind it.
+        sacrificial = threading.Thread(target=scheduler.infer, args=(_marked_frame(1),))
+        sacrificial.start()
+        wait_for(detector.first_call_seen.is_set, message="first batch pickup")
+        racer = scheduler.submit(_marked_frame(2))
+        wait_for(lambda: scheduler._queue.qsize() >= 1, message="queued submission")
+
+        # Simulate the 30s join expiring while the detector is still wedged.
+        scheduler._thread.join = lambda timeout=None: None  # type: ignore[method-assign]
+        scheduler.close()
+        scheduler._thread.join = real_join  # type: ignore[method-assign]
+
+        # close() must not have consumed the sentinel or the raced future:
+        # the still-alive thread owns the queue and will drain it itself.
+        assert scheduler._thread.is_alive()
+        assert not racer.done()
+
+        # Once the detector unblocks, the thread's own _drain() resolves the
+        # raced future and observes the preserved sentinel to exit cleanly.
+        detector.gate.set()
+        assert racer.result(timeout=5.0)[0].class_id == 2
+        scheduler._thread.join(timeout=5.0)
+        assert not scheduler._thread.is_alive()
+    finally:
+        detector.gate.set()
+        sacrificial.join(5.0)
+
+
+def test_scheduler_close_returns_when_detector_wedged_and_queue_full():
+    """close() must return within its join timeout even when the detector is
+    wedged inside infer() AND the bounded queue is saturated by worker threads
+    (one blocked in submit() holding _close_lock). A blocking sentinel put or a
+    blocking submit() put under the lock would deadlock close() indefinitely."""
+    detector = GateDetector()
+    # maxsize = max(4*4, 16) = 16; flood well past it to guarantee saturation.
+    scheduler = InferenceScheduler(detector, max_batch=4, max_delay_ms=5)
+    submitters: list[threading.Thread] = []
+    try:
+        errors: list[Exception] = []
+
+        def submit(value: int) -> None:
+            try:
+                scheduler.submit(_marked_frame(value))
+            except Exception as exc:  # closing scheduler rejects late submits
+                errors.append(exc)
+
+        # The first submit wedges the detector inside infer(); the rest pile up.
+        for value in range(40):
+            t = threading.Thread(target=submit, args=(value,))
+            t.start()
+            submitters.append(t)
+        wait_for(detector.first_call_seen.is_set, message="first batch pickup")
+        # Saturate the queue so a submit() blocks in put() holding _close_lock.
+        wait_for(lambda: scheduler._queue.full(), message="queue saturated")
+
+        # close() from a separate thread must not hang: bound it well under the
+        # 30s default so the test fails fast on the original blocking-put design.
+        elapsed: list[float] = []
+
+        def closer() -> None:
+            started = time.monotonic()
+            scheduler.close(timeout=1.0)
+            elapsed.append(time.monotonic() - started)
+
+        closing = threading.Thread(target=closer)
+        closing.start()
+        closing.join(10.0)
+        assert not closing.is_alive(), "close() deadlocked on wedged detector"
+        assert elapsed and elapsed[0] < 5.0
+
+        # Every blocked/late submit() unblocked into a clean rejection, never
+        # orphaned — so no worker thread is left hanging on a full-queue put.
+        for t in submitters:
+            t.join(5.0)
+        assert not any(t.is_alive() for t in submitters)
+        assert all(isinstance(e, RuntimeError) for e in errors)
+    finally:
+        detector.gate.set()
+        for t in submitters:
+            t.join(5.0)
 
 
 # ---------------------------------------------------------------------
@@ -492,6 +656,29 @@ def test_snapshot_saver_disabled(tmp_path: Path):
     assert saver.maybe_save(_event(EventType.WATCHLIST_HIT), frame, []) is None
 
 
+def test_snapshot_write_error_degrades_not_crashes(tmp_path: Path):
+    # media_dir is a regular FILE, so mkdir(parents=True) under it raises OSError
+    # (disk-full / permission / read-only FS behave the same). A snapshot write
+    # failure must return None, never propagate and tear down the stream.
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_bytes(b"x")
+    saver = SnapshotSaver(SnapshotConfig(), blocker)
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    assert saver.maybe_save(_event(EventType.WATCHLIST_HIT), frame, []) is None
+
+
+def test_snapshot_bad_wall_ts_degrades_not_crashes(tmp_path: Path):
+    # An out-of-range wall_ts (defensive: today it's always time.time()) makes
+    # datetime.fromtimestamp raise OverflowError — one malformed event must not
+    # be fatal to the whole stream.
+    saver = SnapshotSaver(SnapshotConfig(), tmp_path)
+    frame = np.zeros((60, 80, 3), dtype=np.uint8)
+    bad = Event(
+        type=EventType.WATCHLIST_HIT, stream_id="s1", timestamp=1.0, wall_ts=1e20, data={}
+    )
+    assert saver.maybe_save(bad, frame, []) is None
+
+
 # ---------------------------------------------------------------------
 # sources
 # ---------------------------------------------------------------------
@@ -557,6 +744,44 @@ def test_open_source_rtsp_falls_back_to_opencv(monkeypatch: pytest.MonkeyPatch):
     source.close()  # never connected; must still be safe
 
 
+def test_opencv_source_connect_but_no_frames_grows_backoff(monkeypatch: pytest.MonkeyPatch):
+    # A camera that ACCEPTS the connection but never delivers a decodable frame
+    # (powered-but-dead stream, auth OK but no media) must still ride the
+    # 1s -> 30s exponential backoff — resetting on open() would pin it at ~1s
+    # forever, a tight reconnect loop + STREAM_ERROR flood.
+    class _DeadCap:
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, prop: int) -> float:
+            return 0.0
+
+        def read(self):
+            return False, None  # opens fine, never yields a frame
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: _DeadCap())
+    source = OpenCvSource(StreamConfig(id="s1", source="rtsp://camera.invalid/stream"))
+    monkeypatch.setattr(source._stop, "wait", lambda _t: None)  # no real sleeps
+
+    # error_cb fires at the head of each _backoff, before the delay grows, so it
+    # records the delay about to be applied; stop the loop once we have enough.
+    applied: list[float] = []
+
+    def _record(_message: str) -> None:
+        applied.append(source._backoff_s)
+        if len(applied) >= 6:
+            source.request_stop()
+
+    source.error_cb = _record
+    with pytest.raises(StopIteration):
+        next(iter(source))
+    source.close()
+    assert applied == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
 # ---------------------------------------------------------------------
 # end-to-end: process_video and live worker lifecycle
 # ---------------------------------------------------------------------
@@ -619,6 +844,132 @@ def test_process_video_end_to_end(tmp_path: Path, fake_components):
     _assert_no_leaked_threads(before)
 
 
+def test_process_video_releases_model_sessions_on_teardown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_components
+):
+    """The per-job StreamProcessor's ALPR/attribute model sessions must be
+    released on teardown so native/GPU memory is not held across jobs.
+
+    Attributes expose ``close()``; the real AlprPipeline has no such hook,
+    so this double mirrors it (``_detector``/``_ocr`` model refs) and the
+    release must drop those references — the production path the earlier
+    synthetic ``close()`` on the ALPR fake never exercised.
+    """
+    closed: list[str] = []
+    alprs: list[SessionAlpr] = []
+
+    class ClosingAttributes(FakeAttributes):
+        def close(self) -> None:
+            closed.append("attributes")
+
+    class SessionAlpr(FakeAlpr):
+        def __init__(self, config, watchlists, privacy) -> None:
+            super().__init__(config, watchlists, privacy)
+            self._detector = object()  # stand-in onnxruntime-backed detector
+            self._ocr = object()  # stand-in onnxruntime-backed OCR
+            alprs.append(self)
+
+    monkeypatch.setattr(panoptes.attributes, "AttributePipeline", ClosingAttributes)
+    monkeypatch.setattr(panoptes.alpr, "AlprPipeline", SessionAlpr)
+
+    video = write_video(tmp_path / "input.mp4")
+    config = AppConfig(streams=[], server=ServerConfig(media_dir=str(tmp_path / "media")))
+    manager = PipelineManager(config, EventBus())
+    try:
+        manager.process_video(video, StreamConfig(id="job1", source=str(video)))
+    finally:
+        manager.stop()
+
+    assert closed == ["attributes"]
+    # the real AlprPipeline has no close(): its native model refs are dropped
+    assert alprs and alprs[0]._detector is None and alprs[0]._ocr is None
+
+
+def _stream_metric_children(stream_id: str) -> int:
+    """Count live prometheus label children keyed on ``stream_id`` across
+    every stream-labelled collector (frames, tracks, events, plates, fps)."""
+    total = 0
+    for collector in _stream_labelled_collectors():
+        stream_at = collector._labelnames.index("stream")
+        total += sum(1 for key in collector._metrics if key[stream_at] == stream_id)
+    return total
+
+
+def test_process_video_removes_stream_metric_labels_on_teardown(
+    tmp_path: Path, fake_components
+):
+    """A finished batch job must drop its per-stream metric label children.
+
+    Batch jobs get an effectively-unbounded uuid-derived stream id, so leaving
+    their prometheus children behind grows the registry (and every /metrics
+    scrape) without bound. finalize() removes them; a config stream's children
+    must survive untouched.
+    """
+    video = write_video(tmp_path / "input.mp4")
+    config = AppConfig(streams=[], server=ServerConfig(media_dir=str(tmp_path / "media")))
+    manager = PipelineManager(config, EventBus())
+
+    job_id = "job-deadbeef"
+    survivor = "cam-config-1"
+    metrics.FRAMES_PROCESSED.labels(stream=survivor).inc()  # a config stream must be kept
+    assert _stream_metric_children(job_id) == 0
+
+    try:
+        manager.process_video(video, StreamConfig(id=job_id, source=str(video)))
+    finally:
+        manager.stop()
+
+    # the job touched frames/tracks/events children while running, all now gone
+    assert _stream_metric_children(job_id) == 0
+    assert job_id.encode() not in metrics.render_metrics()[0]
+    # a config-declared stream's children are left intact
+    assert _stream_metric_children(survivor) == 1
+
+
+def test_release_processor_failure_logs_the_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failing release is best-effort but must name the exception, not
+    just the stage — so the operator knows WHAT failed."""
+
+    class Boom:
+        def close(self) -> None:
+            raise RuntimeError("session teardown exploded")
+
+    processor = types.SimpleNamespace(_attributes=Boom(), _alpr=None)
+    with caplog.at_level(logging.WARNING, logger="panoptes.pipeline.manager"):
+        PipelineManager._release_processor(processor)  # type: ignore[arg-type]
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "Boom" in warnings[0].message
+    assert "session teardown exploded" in warnings[0].message
+
+
+def test_open_writer_open_failure_logs_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A VideoWriter that fails to open degrades to no annotated video, but
+    the silent path must leave a server-side reason in the log."""
+
+    class UnopenableWriter:
+        def isOpened(self) -> bool:
+            return False
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(cv2, "VideoWriter", lambda *args, **kwargs: UnopenableWriter())
+    out = tmp_path / "annotated.mp4"
+    with caplog.at_level(logging.WARNING, logger="panoptes.pipeline.manager"):
+        writer, writer_path = PipelineManager._open_writer(out, 30.0, (48, 64, 3))
+
+    assert writer is None and writer_path is None
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert str(out) in warnings[0].message
+
+
 def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
     video = write_video(tmp_path / "input.mp4")
     stream = StreamConfig(
@@ -649,6 +1000,9 @@ def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
         assert status["state"] == "ended"
         assert status["frames"] == 60 and status["dropped"] == 0
         assert status["last_error"] is None
+        # The /analytics endpoint + annotate() overlay read status()["analytics"]
+        # off the live processor's AnalyticsEngine summary.
+        assert status["analytics"] == {"lines": {}, "zones": {}}
 
         jpeg = manager.latest_jpeg("s1")
         assert jpeg is not None and jpeg[:2] == b"\xff\xd8"  # JPEG magic
@@ -656,6 +1010,212 @@ def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
     finally:
         manager.stop()
     _assert_no_leaked_threads(before)
+
+
+def test_manager_stop_racing_start_stream_does_not_resurrect(
+    tmp_path: Path, fake_components
+):
+    """A start_stream() racing an in-progress stop() must not leak.
+
+    stop() latches ``_stopped`` under the lock, then joins workers OUTSIDE
+    the lock (up to seconds while a source read drains). A start_stream()
+    that grabs the lock in that window must no-op rather than rebuild a
+    fresh detector/scheduler/worker that this teardown never captures.
+    """
+    video = write_video(tmp_path / "input.mp4")
+    stream = StreamConfig(
+        id="s1", source=str(video), governor=GovernorConfig(enabled=False)
+    )
+    config = AppConfig(
+        streams=[stream], server=ServerConfig(media_dir=str(tmp_path / "media"))
+    )
+
+    before = set(threading.enumerate())
+    manager = PipelineManager(config, EventBus())
+    manager._ensure_scheduler()  # build the shared scheduler up front
+    worker = StreamWorker(
+        stream, config, manager._scheduler, manager._bus, manager._media_dir
+    )
+    manager._workers["s1"] = worker
+
+    # Fire a concurrent start_stream() from inside worker.stop() — i.e. the
+    # exact window after stop() latched _stopped but before it closed the
+    # captured scheduler/detector. Before the fix this rebuilt a new stack.
+    started = threading.Event()
+    race_done = threading.Event()
+
+    def racing_stop(*, timeout: float | None = None) -> bool:
+        thread = threading.Thread(target=lambda: (manager.start_stream("s1"), race_done.set()))
+        thread.start()
+        started.set()
+        thread.join(5.0)
+        return True
+
+    worker.stop = racing_stop  # type: ignore[method-assign]
+    manager.stop()
+
+    assert started.is_set() and race_done.is_set()
+    # The racing start must have been a no-op: no new scheduler/detector and
+    # no live worker were resurrected, and stop() left the manager torn down.
+    assert manager._scheduler is None
+    assert manager._detector is None
+    assert not manager._workers["s1"].is_alive
+    _assert_no_leaked_threads(before)
+
+
+def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_components
+):
+    # RTSP/HTTP sources routinely embed credentials; they must never reach
+    # STREAM_STARTED / STREAM_ERROR event data (feeds, DB, webhooks are sinks).
+    source = "rtsp://admin:S3cr3t!@10.0.0.5:554/live"
+    stream = StreamConfig(id="s1", source=source)
+    config = AppConfig(server=ServerConfig(media_dir=str(tmp_path / "media")))
+    bus = EventBus()
+    events: list[Event] = []
+    bus.add_handler(events.append)
+
+    # Fake source that ends immediately: drives _run() past STREAM_STARTED
+    # (a real rtsp open would block); the raw URL never touches the network.
+    class _EmptySource:
+        def __init__(self) -> None:
+            self.error_cb = None
+
+        def __iter__(self):
+            return iter(())
+
+        def close(self) -> None:
+            pass
+
+        def request_stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "panoptes.pipeline.worker.open_source", lambda cfg: _EmptySource(), raising=True
+    )
+
+    worker = StreamWorker(stream, config, scheduler=None, bus=bus, media_dir=tmp_path)
+    worker.start()
+    wait_for(
+        lambda: any(e.type is EventType.STREAM_ENDED for e in list(events)),
+        message="STREAM_ENDED",
+    )
+
+    # STREAM_ERROR messages embed the raw source URL mid-string (source.py).
+    worker._on_source_error(f"open failed: {source}")
+    worker._fail(f"read failed: {source}")
+
+    for event in events:
+        blob = repr(event.data)
+        assert "S3cr3t" not in blob and "admin:" not in blob, blob
+    assert "S3cr3t" not in (worker.status()["last_error"] or "")
+
+    started = next(e for e in events if e.type is EventType.STREAM_STARTED)
+    assert started.data["source"] == "rtsp://***@10.0.0.5:554/live"
+    error = next(e for e in events if e.type is EventType.STREAM_ERROR)
+    assert error.data["error"] == "open failed: rtsp://***@10.0.0.5:554/live"
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("rtsp://user:pass@cam.local:554/stream", "rtsp://***@cam.local:554/stream"),
+        # Unencoded '@' in the password: userinfo runs up to the LAST '@'.
+        ("rtsp://user:p@ss@cam.local:554/stream", "rtsp://***@cam.local:554/stream"),
+        # A '/' in the password (base64/random secrets carry one) must not fail
+        # OPEN: fail CLOSED and redact up to the credential '@' (CWE-532).
+        (
+            "rtsp://admin:Xy/9$kQ@10.0.0.5:554/Streaming/Channels/101",
+            "rtsp://***@10.0.0.5:554/Streaming/Channels/101",
+        ),
+        # A '/'-in-password with the credential ':' AFTER that '/' still masks.
+        ("rtsp://u/s:er:p/w@host/stream", "rtsp://***@host/stream"),
+        # Round-7 over-mask regression: a bare host:port colon is NOT a
+        # credential, so a credential-FREE port URL with a path/query '@' passes
+        # through unchanged (mirrors the canonical schemas.py cases exactly).
+        ("rtsp://cam.local:554/live@2x", "rtsp://cam.local:554/live@2x"),
+        ("https://host:8080/path@ref", "https://host:8080/path@ref"),
+        ("https://api:443/redirect?u=a@b.com", "https://api:443/redirect?u=a@b.com"),
+        (
+            "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
+            "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
+        ),
+        # Bracketed IPv6 host: credential-free path/query '@' passes through, but
+        # a real userinfo credential still masks (mirrors the canonical cases).
+        ("rtsp://[::1]:554/live@2x", "rtsp://[::1]:554/live@2x"),
+        ("rtsp://[2001:db8::1]:554/live@2x", "rtsp://[2001:db8::1]:554/live@2x"),
+        ("rtsp://user:pass@[::1]:554/live", "rtsp://***@[::1]:554/live"),
+        # A '?password='/'?token=' query secret is redacted alongside userinfo.
+        (
+            "postgresql://host/db?password=secret&sslmode=require",
+            "postgresql://host/db?password=***&sslmode=require",
+        ),
+        ("postgresql://user:pass@host/db?pwd=secret", "postgresql://***@host/db?pwd=***"),
+        # A '@' in the path (not the authority) is left untouched.
+        ("https://api.local/v1@ref", "https://api.local/v1@ref"),
+        ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
+        ("not-a-url", "not-a-url"),
+    ],
+)
+def test_worker_scrub_url_mirrors_schemas(url: str, expected: str) -> None:
+    # The worker keeps a local copy of ``scrub_url`` (no api import chain); it
+    # must mask identically, including the fail-CLOSED '/'-in-password case.
+    from panoptes.api.schemas import scrub_url as canonical_scrub_url
+    from panoptes.pipeline.worker import scrub_url as worker_scrub_url
+
+    assert worker_scrub_url(url) == expected
+    assert worker_scrub_url(url) == canonical_scrub_url(url)
+
+
+def test_stream_worker_status_carries_processor_analytics_summary(
+    tmp_path: Path,
+) -> None:
+    """status() must surface the live AnalyticsEngine summary so the
+    /analytics endpoint and annotate() overlay render real line/zone
+    counters — not the empty dict the fake manager fabricated."""
+    stream = StreamConfig(id="s1", source="stub")
+    config = AppConfig(server=ServerConfig(media_dir=str(tmp_path / "media")))
+    worker = StreamWorker(stream, config, scheduler=None, bus=EventBus(), media_dir=tmp_path)
+
+    # No processor yet (created/idle): analytics is the empty dict.
+    assert worker.status()["analytics"] == {}
+
+    # A running processor: its summary() flows through unmodified. A distinct
+    # payload guards against a hardcoded {} passing the assertion.
+    summary = {"lines": {"main": {"forward": {"car": 3}}}, "zones": {}}
+    worker._processor = types.SimpleNamespace(  # type: ignore[assignment]
+        frames_processed=7,
+        frames_dropped=1,
+        active_track_count=2,
+        summary=lambda: summary,
+    )
+    assert worker.status()["analytics"] == summary
+
+
+def test_stream_worker_failure_logs_scrubbed_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A crashed worker must be visible in server logs, but the log line
+    must carry the credential-scrubbed message only — never a live
+    traceback embedding the raw rtsp ``user:pass@`` URL (CWE-532)."""
+    source = "rtsp://admin:S3cr3t!@10.0.0.5:554/live"
+    stream = StreamConfig(id="s1", source=source)
+    config = AppConfig(server=ServerConfig(media_dir=str(tmp_path / "media")))
+
+    def _boom(cfg):
+        raise RuntimeError(f"open failed: {source}")
+
+    monkeypatch.setattr("panoptes.pipeline.worker.open_source", _boom, raising=True)
+
+    worker = StreamWorker(stream, config, scheduler=None, bus=EventBus(), media_dir=tmp_path)
+    with caplog.at_level(logging.ERROR, logger="panoptes.pipeline.worker"):
+        worker.start()
+        wait_for(lambda: worker.status()["state"] == "error", message="error state")
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "s1" in errors[0].message
+    assert "S3cr3t" not in errors[0].message and "admin:" not in errors[0].message
 
 
 def test_manager_status_lists_idle_streams(tmp_path: Path):

@@ -290,7 +290,8 @@ def test_makefile_targets() -> None:
     text = (REPO / "Makefile").read_text(encoding="utf-8")
     for target in (
         "setup", "test", "lint", "serve", "demo", "docker-cpu", "docker-gpu",
-        "compose-up", "compose-gpu", "license-gate", "clean",
+        "compose-up", "compose-gpu", "license-gate", "license-gate-release",
+        "clean",
     ):
         assert f"\n{target}:" in text, f"missing make target: {target}"
     assert "--project-directory ." in text  # compose paths anchor at repo root
@@ -314,6 +315,40 @@ def test_makefile_compose_seed_is_venv_free() -> None:
         assert "$(PY)" not in recipe, f"{target} must not depend on the dev venv"
         assert ".venv" not in recipe
         assert "cp -n deploy/config/panoptes.compose.yaml config/panoptes.yaml" in recipe
+
+
+def _makefile_recipes() -> dict[str, list[str]]:
+    """target -> recipe lines, parsed from the Makefile."""
+    text = (REPO / "Makefile").read_text(encoding="utf-8")
+    recipes: dict[str, list[str]] = {}
+    current: str | None = None
+    for line in text.splitlines():
+        if line.startswith("\t") and current:
+            recipes[current].append(line)
+        elif line and not line.startswith(("\t", "#", ".", " ")) and ":" in line:
+            current = line.split(":", 1)[0].strip()
+            recipes.setdefault(current, [])
+    return recipes
+
+
+def test_makefile_license_gate_matches_ci() -> None:
+    """The documented contributor gate (`make license-gate`) must invoke the
+    same exempted form CI runs, or a fresh clone fails: opencv-python-headless
+    is a base dep whose wheel bundles GPL x264/x265, so the unexempted form
+    trips the binary scan (see docs/LICENSING.md). The `-release` variant keeps
+    the no-exemption form for in-image certification."""
+    recipes = _makefile_recipes()
+    gate = "\n".join(recipes["license-gate"])
+    assert "deploy/scripts/license_gate.py" in gate
+    assert "--exempt-package opencv-python-headless" in gate, (
+        "license-gate must exempt opencv-python-headless like CI does"
+    )
+    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "license_gate.py --exempt-package opencv-python-headless" in ci
+    # The release target certifies the redistributed image — no exemptions.
+    release = "\n".join(recipes["license-gate-release"])
+    assert "deploy/scripts/license_gate.py" in release
+    assert "--exempt-package" not in release
 
 
 # ---------------------------------------------------------- license gate ----

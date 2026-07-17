@@ -12,7 +12,8 @@ Algorithm
    is treated as a whole-read outlier.
 2. For each character slot, every read in the group adds its confidence as
    weight to the character it saw; the consensus character is the weight
-   argmax (ties resolve to the earliest-seen character, deterministically).
+   argmax (exact-weight ties break to the lower codepoint, so the result is
+   a function of the read multiset alone — independent of arrival order).
 3. Consensus confidence is the mean, over slots, of the winning character's
    weight share (``winner_weight / slot_total_weight``) — 1.0 means every
    read agreed on every slot.
@@ -96,7 +97,10 @@ class PlateVoter:
             for text, conf in group:
                 weights[text[i]] = weights.get(text[i], 0.0) + conf
             total = sum(weights.values())
-            winner = max(weights, key=weights.__getitem__)
+            # Highest weight, then lowest codepoint: a deterministic, read-order
+            # independent tie-break (bare ``max`` would pick the first-inserted
+            # key, i.e. whichever character happened to arrive first).
+            winner = min(weights, key=lambda ch: (-weights[ch], ch))
             chars.append(winner)
             shares.append(weights[winner] / total if total > 0 else 0.0)
         confidence = sum(shares) / len(shares) if shares else 0.0

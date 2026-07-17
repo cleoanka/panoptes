@@ -178,6 +178,41 @@ class TestLineCounter:
         assert events == []
         assert counter.total("eastbound") == 0
 
+    def test_no_wrong_way_when_direction_unset(self) -> None:
+        counter = LineCounter(LINE)  # allowed_direction defaults to None
+        track = make_track()
+        # Backward pass would be wrong-way if a direction were enforced.
+        events = drive(counter, track, [130.0, 120.0, 110.0, 90.0, 70.0, 60.0])
+        assert [e.type for e in events] == [EventType.LINE_CROSSED]
+        assert events[0].data["direction_canonical"] == "backward"
+
+    def test_wrong_way_emitted_against_allowed_direction(self) -> None:
+        cfg = LINE.model_copy(update={"allowed_direction": "forward"})
+        counter = LineCounter(cfg)
+        track = make_track()
+        # Right-to-left = backward = opposes the allowed 'forward'.
+        events = drive(counter, track, [130.0, 120.0, 110.0, 90.0, 70.0, 60.0])
+        assert [e.type for e in events] == [EventType.LINE_CROSSED, EventType.WRONG_WAY]
+        crossed, wrong = events
+        assert crossed.data["direction_canonical"] == "backward"
+        assert wrong.track_id == track.track_id
+        assert wrong.vehicle_class == "car"
+        assert wrong.data == {
+            "line": "l1",
+            "line_name": "Main gate",
+            "direction_canonical": "backward",
+            "allowed_direction": "forward",
+        }
+
+    def test_no_wrong_way_when_crossing_matches_allowed(self) -> None:
+        cfg = LINE.model_copy(update={"allowed_direction": "forward"})
+        counter = LineCounter(cfg)
+        track = make_track()
+        # Left-to-right = forward = the allowed direction: no wrong-way.
+        events = drive(counter, track, [60.0, 80.0, 90.0, 110.0, 130.0, 150.0])
+        assert [e.type for e in events] == [EventType.LINE_CROSSED]
+        assert events[0].data["direction_canonical"] == "forward"
+
 
 # ---------------------------------------------------------------------
 # zones
@@ -248,6 +283,48 @@ class TestZoneMonitor:
         assert events[0].data["dwell_s"] == pytest.approx(3.0)
         assert monitor.occupancy() == 0
 
+    def test_class_flip_out_of_filter_frees_occupancy(self) -> None:
+        # A CAR enters a car-only zone, then ByteTrack's class vote flips it
+        # to TRUCK mid-dwell: the exit must fire so occupancy never drifts.
+        cfg = ZONE.model_copy(update={"classes": [VehicleClass.CAR]})
+        monitor = ZoneMonitor(cfg)
+        track = make_track(cls=VehicleClass.CAR)
+        step(track, 100.0, 100.0, 0.5)
+        events = monitor.update([track], 0.5, 1_000_000.5)
+        assert [e.type for e in events] == [EventType.ZONE_ENTERED]
+        assert monitor.occupancy() == 1
+
+        # Class votes out of the filter while still geometrically inside.
+        track.vehicle_class = VehicleClass.TRUCK
+        step(track, 100.0, 100.0, 1.5)
+        events = monitor.update([track], 1.5, 1_000_001.5)
+        assert [e.type for e in events] == [EventType.ZONE_EXITED]
+        assert events[0].data["dwell_s"] == pytest.approx(1.0)
+        assert monitor.occupancy() == 0
+        assert "z1" not in track.data[ZONE_STATE_KEY]
+
+        # And it never re-enters as long as it stays a filtered-out class.
+        step(track, 100.0, 100.0, 2.0)
+        assert monitor.update([track], 2.0, 1_000_002.0) == []
+        assert monitor.occupancy() == 0
+
+    def test_class_flip_into_filter_inside_zone_enters(self) -> None:
+        # The mirror case: a TRUCK sitting inside a car-only zone is ignored
+        # until its class votes to CAR, which must then count as an entry.
+        cfg = ZONE.model_copy(update={"classes": [VehicleClass.CAR]})
+        monitor = ZoneMonitor(cfg)
+        track = make_track(cls=VehicleClass.TRUCK)
+        step(track, 100.0, 100.0, 0.5)
+        assert monitor.update([track], 0.5, 1_000_000.5) == []
+        assert monitor.occupancy() == 0
+        assert "z1" not in track.data.get(ZONE_STATE_KEY, {})
+
+        track.vehicle_class = VehicleClass.CAR
+        step(track, 100.0, 100.0, 1.0)
+        events = monitor.update([track], 1.0, 1_000_001.0)
+        assert [e.type for e in events] == [EventType.ZONE_ENTERED]
+        assert monitor.occupancy() == 1
+
 
 # ---------------------------------------------------------------------
 # rules engine
@@ -289,6 +366,46 @@ class TestRulesEngine:
         engine = RulesEngine([rule], [], STREAM_ID, known_geometry_ids=set())
         ev = make_event(EventType.SPEEDING, {"speed_kmh": 70.0})
         assert engine.evaluate([ev], {}, 1.0, 1_000_001.0) == []
+
+    def test_track_finished_evicts_cooldown_state(self) -> None:
+        # A finished track's cooldown entry must not leak forever (track_id
+        # is never reused). The final-frame fire is preserved (eviction runs
+        # after evaluation), but the entry is gone afterwards.
+        rule = RuleConfig(
+            id="r-speed",
+            when={"type": "speed", "min_kmh": 80.0},
+            cooldown_s=10.0,
+        )
+        engine = RulesEngine([rule], [], STREAM_ID, known_geometry_ids=set())
+        track = make_track()
+        track.speed_kmh = 95.0
+
+        speed = make_event(EventType.SPEEDING, {"speed_kmh": 95.0}, timestamp=5.0)
+        finish = make_event(EventType.TRACK_FINISHED, {}, timestamp=5.0)
+        # Track fires and finishes in the same frame: fire is preserved...
+        fired = engine.evaluate([speed, finish], {1: track}, 5.0, 1_000_005.0)
+        assert len(fired) == 1
+        # ...but its cooldown entry is evicted, leaving nothing behind.
+        assert engine._last_fired == {}
+
+    def test_rule_level_cooldown_survives_track_finished(self) -> None:
+        # Rule-level entries (track_id is None) are not per-track state and
+        # must not be evicted when unrelated tracks finish.
+        rule = RuleConfig(
+            id="r-cross",
+            when={"type": "line_cross", "line": "l1", "direction": "any"},
+            cooldown_s=10.0,
+        )
+        engine = RulesEngine([rule], [], STREAM_ID, known_geometry_ids={"l1"})
+        # Trackless LINE_CROSSED fires the rule with a rule-level key.
+        cross = make_event(
+            EventType.LINE_CROSSED,
+            {"line": "l1", "direction_canonical": "forward"},
+            track_id=None,
+        )
+        finish = make_event(EventType.TRACK_FINISHED, {}, track_id=7, timestamp=1.0)
+        assert len(engine.evaluate([cross, finish], {}, 1.0, 1_000_001.0)) == 1
+        assert (rule.id, None) in engine._last_fired
 
     def test_all_of_zone_dwell_and_class(self) -> None:
         rule = RuleConfig(
@@ -560,6 +677,34 @@ class TestActionDispatcher:
         assert fired[0].data["snapshot_requested"] is True  # flag set before delivery
         dispatcher.close()
         assert calls == ["http://localhost:9/hook"]
+
+    def test_close_shared_drains_singleton(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[str] = []
+
+        def fake_post(url: str, **kwargs: Any) -> Any:
+            calls.append(url)
+
+            class _Resp:
+                status_code = 200
+
+            return _Resp()
+
+        monkeypatch.setattr(actions_mod.httpx, "post", fake_post)
+        ActionDispatcher._shared = None  # fresh singleton for this test
+        try:
+            dispatcher = ActionDispatcher.shared()
+            event = make_event(EventType.RULE_TRIGGERED, {"rule_name": "x"})
+            dispatcher.dispatch(event, [WebhookAction(url="http://localhost:9/hook")])
+            ActionDispatcher.close_shared()  # shutdown hook: flush + join, not drop
+            assert calls == ["http://localhost:9/hook"]
+            assert dispatcher._closed is True
+        finally:
+            ActionDispatcher._shared = None
+
+    def test_close_shared_noop_without_singleton(self) -> None:
+        ActionDispatcher._shared = None
+        ActionDispatcher.close_shared()  # must not raise when nothing was started
+        assert ActionDispatcher._shared is None
 
 
 # ---------------------------------------------------------------------

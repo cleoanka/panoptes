@@ -51,6 +51,21 @@ _MIN_DT_S = 1e-6
 # A track re-emits SPEEDING at most this often (stream-relative seconds).
 _SPEEDING_REEMIT_S = 30.0
 
+# A track re-emits STOPPED_VEHICLE at most this often (stream-relative
+# seconds), mirroring the SPEEDING throttle.
+_STOPPED_REEMIT_S = 30.0
+
+# Minimum reference baseline as a fraction of window_s. When a track is
+# re-acquired all in-window points cluster near the newest frame, so even
+# the earliest one gives a sub-window dt that would amplify bbox jitter into
+# a large raw km/h and seed the EMA from it. Below this the estimate is
+# deferred until a full-baseline reference exists.
+_MIN_REFERENCE_DT_FRACTION = 0.3
+
+# Track.data key holding the timestamp of the first dip below the stopped
+# threshold in the current stationary spell (cleared when speed rises).
+_STOPPED_SINCE_KEY = "_stopped_since_ts"
+
 
 class MotionEstimator:
     """Fills ``TrackPoint.ground`` and derives per-track kinematics.
@@ -93,6 +108,9 @@ class MotionEstimator:
             event = self._maybe_speeding(track, stream_id, wall_ts)
             if event is not None:
                 events.append(event)
+            stopped = self._maybe_stopped(track, stream_id, wall_ts)
+            if stopped is not None:
+                events.append(stopped)
         return events
 
     # ------------------------------------------------------------------
@@ -142,20 +160,46 @@ class MotionEstimator:
         if track.age_seconds < self._speed.min_track_s:
             return
         window_start = current.timestamp - self._speed.window_s
-        grounded = [
-            (p.timestamp, p.ground[0], p.ground[1])
-            for p in track.points
-            if p.ground is not None
-        ]
-        # At least two grounded observations inside the window: a track
-        # re-acquired after a long occlusion must not report a speed
-        # computed across the gap.
-        windowed = sum(1 for ts, _, _ in grounded if ts >= window_start)
-        if windowed < 2:
+        # A gap larger than the window (occlusion / re-acquisition) means no
+        # prior grounded point survives inside the window, so this call cannot
+        # refresh the speed and any existing ``speed_kmh`` predates the gap.
+        # Leaving it in place lets the STOPPED/SPEEDING emitters fire on a
+        # phantom state no fresh observation supports; invalidate it so they
+        # short-circuit until a windowed measurement is re-established. The
+        # stopped-dwell start is cleared too, else ``stopped_s`` would span
+        # the entire occlusion.
+        prev = next(
+            (p for p in reversed(track.points[:-1]) if p.ground is not None), None
+        )
+        if prev is not None and current.timestamp - prev.timestamp > self._speed.window_s:
+            track.speed_kmh = None
+            track.data.pop(_STOPPED_SINCE_KEY, None)
+        # Walk the (append-only, time-ordered) trail backwards from the
+        # point before ``current``, keeping the earliest point still inside
+        # the window. That earliest in-window point is the reference: it is
+        # the one closest to ``window_start`` and so maximises the baseline,
+        # and staying inside the window keeps a track re-acquired after a
+        # long occlusion from reporting a speed computed across the gap.
+        # Only the last ~window_s of trail can qualify, so the walk stops at
+        # the first out-of-window point instead of scanning full history.
+        ref: tuple[float, float, float] | None = None
+        for point in reversed(track.points[:-1]):
+            if point.ground is None:
+                continue
+            if point.timestamp < window_start:
+                break
+            ref = (point.timestamp, point.ground[0], point.ground[1])
+        # A reference must exist *inside* the window (the current point is
+        # already in-window, so one prior in-window point makes two).
+        if ref is None:
             return
-        ref_ts, ref_x, ref_y = min(grounded[:-1], key=lambda g: abs(g[0] - window_start))
+        ref_ts, ref_x, ref_y = ref
         dt = current.timestamp - ref_ts
-        if dt <= _MIN_DT_S:
+        # A sub-window baseline means every in-window point clusters near
+        # ``current`` (typically a just-re-acquired track): raw_kmh would
+        # divide bbox jitter by a tiny dt and seed the EMA from that spike.
+        # Defer until a full-baseline reference exists.
+        if dt <= _MIN_DT_S or dt < _MIN_REFERENCE_DT_FRACTION * self._speed.window_s:
             return
         dx = current.ground[0] - ref_x
         dy = current.ground[1] - ref_y
@@ -198,6 +242,39 @@ class MotionEstimator:
             track_id=track.track_id,
             vehicle_class=track.vehicle_class.value,
             data={"speed_kmh": round(track.speed_kmh, 1), "limit_kmh": limit},
+        )
+
+    def _maybe_stopped(self, track: Track, stream_id: str, wall_ts: float) -> Event | None:
+        stopped = self._speed.stopped
+        if not stopped.enabled or track.speed_kmh is None:
+            return None
+        now = track.last_timestamp
+        if track.speed_kmh > stopped.max_speed_kmh:
+            # Moving again: reset the dwell so the next stop is timed afresh.
+            track.data.pop(_STOPPED_SINCE_KEY, None)
+            return None
+        since = track.data.get(_STOPPED_SINCE_KEY)
+        if since is None:
+            track.data[_STOPPED_SINCE_KEY] = now
+            return None
+        if (now - float(since)) < stopped.min_stopped_s:
+            return None
+        last_emitted = track.data.get("stopped_emitted_ts")
+        if last_emitted is not None and (now - float(last_emitted)) < _STOPPED_REEMIT_S:
+            return None
+        track.data["stopped_emitted_ts"] = now
+        return Event(
+            type=EventType.STOPPED_VEHICLE,
+            stream_id=stream_id,
+            timestamp=now,
+            wall_ts=wall_ts,
+            track_id=track.track_id,
+            vehicle_class=track.vehicle_class.value,
+            data={
+                "speed_kmh": round(track.speed_kmh, 1),
+                "threshold_kmh": stopped.max_speed_kmh,
+                "stopped_s": round(now - float(since), 1),
+            },
         )
 
 
