@@ -46,6 +46,9 @@ class PipelineManager:
         self._stopping: set[str] = set()
         self._scheduler: InferenceScheduler | None = None
         self._detector: Detector | None = None
+        # Latched by stop(): a start racing an in-progress stop() must not
+        # resurrect a fresh scheduler/detector/worker that stop() never sees.
+        self._stopped = False
         self._lock = threading.RLock()
 
     # -- shared inference -----------------------------------------------
@@ -75,6 +78,11 @@ class PipelineManager:
     def stop(self) -> None:
         """Stop all workers, then tear down the shared scheduler/detector."""
         with self._lock:
+            # Latch stopped under the lock: worker.stop() joins up to seconds
+            # outside the lock, so a concurrent start_stream() that acquires
+            # the lock in that window must see this and no-op rather than
+            # rebuild a scheduler/detector/worker this teardown never captured.
+            self._stopped = True
             workers = list(self._workers.values())
             scheduler = self._scheduler
             detector = self._detector
@@ -97,6 +105,10 @@ class PipelineManager:
         """
         cfg = self._config.stream(stream_id)  # raises ConfigError when unknown
         with self._lock:
+            if self._stopped:
+                # Manager has been stopped: a start racing that teardown must
+                # not resurrect and leak a scheduler/detector/worker.
+                return
             existing = self._workers.get(stream_id)
             if existing is not None and existing.is_alive:
                 if stream_id in self._stopping:

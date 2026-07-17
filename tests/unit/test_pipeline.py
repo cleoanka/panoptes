@@ -970,6 +970,57 @@ def test_manager_live_stream_lifecycle(tmp_path: Path, fake_components):
     _assert_no_leaked_threads(before)
 
 
+def test_manager_stop_racing_start_stream_does_not_resurrect(
+    tmp_path: Path, fake_components
+):
+    """A start_stream() racing an in-progress stop() must not leak.
+
+    stop() latches ``_stopped`` under the lock, then joins workers OUTSIDE
+    the lock (up to seconds while a source read drains). A start_stream()
+    that grabs the lock in that window must no-op rather than rebuild a
+    fresh detector/scheduler/worker that this teardown never captures.
+    """
+    video = write_video(tmp_path / "input.mp4")
+    stream = StreamConfig(
+        id="s1", source=str(video), governor=GovernorConfig(enabled=False)
+    )
+    config = AppConfig(
+        streams=[stream], server=ServerConfig(media_dir=str(tmp_path / "media"))
+    )
+
+    before = set(threading.enumerate())
+    manager = PipelineManager(config, EventBus())
+    manager._ensure_scheduler()  # build the shared scheduler up front
+    worker = StreamWorker(
+        stream, config, manager._scheduler, manager._bus, manager._media_dir
+    )
+    manager._workers["s1"] = worker
+
+    # Fire a concurrent start_stream() from inside worker.stop() — i.e. the
+    # exact window after stop() latched _stopped but before it closed the
+    # captured scheduler/detector. Before the fix this rebuilt a new stack.
+    started = threading.Event()
+    race_done = threading.Event()
+
+    def racing_stop(*, timeout: float | None = None) -> bool:
+        thread = threading.Thread(target=lambda: (manager.start_stream("s1"), race_done.set()))
+        thread.start()
+        started.set()
+        thread.join(5.0)
+        return True
+
+    worker.stop = racing_stop  # type: ignore[method-assign]
+    manager.stop()
+
+    assert started.is_set() and race_done.is_set()
+    # The racing start must have been a no-op: no new scheduler/detector and
+    # no live worker were resurrected, and stop() left the manager torn down.
+    assert manager._scheduler is None
+    assert manager._detector is None
+    assert not manager._workers["s1"].is_alive
+    _assert_no_leaked_threads(before)
+
+
 def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_components
 ):
