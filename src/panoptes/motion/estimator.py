@@ -160,6 +160,20 @@ class MotionEstimator:
         if track.age_seconds < self._speed.min_track_s:
             return
         window_start = current.timestamp - self._speed.window_s
+        # A gap larger than the window (occlusion / re-acquisition) means no
+        # prior grounded point survives inside the window, so this call cannot
+        # refresh the speed and any existing ``speed_kmh`` predates the gap.
+        # Leaving it in place lets the STOPPED/SPEEDING emitters fire on a
+        # phantom state no fresh observation supports; invalidate it so they
+        # short-circuit until a windowed measurement is re-established. The
+        # stopped-dwell start is cleared too, else ``stopped_s`` would span
+        # the entire occlusion.
+        prev = next(
+            (p for p in reversed(track.points[:-1]) if p.ground is not None), None
+        )
+        if prev is not None and current.timestamp - prev.timestamp > self._speed.window_s:
+            track.speed_kmh = None
+            track.data.pop(_STOPPED_SINCE_KEY, None)
         # Walk the (append-only, time-ordered) trail backwards from the
         # point before ``current``, keeping the earliest point still inside
         # the window. That earliest in-window point is the reference: it is
