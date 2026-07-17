@@ -420,7 +420,7 @@ class TestDecodeClassic:
         for column in range(n):
             out[0, :4, column] = [15 * column, 15 * column, 10, 10]  # disjoint
             out[0, 4 + (column % 80), column] = 0.5 + column / (2 * n)
-        (xyxy, scores, class_ids), = decode_classic(out, conf=0.25, iou=0.5)
+        (xyxy, scores, _class_ids), = decode_classic(out, conf=0.25, iou=0.5)
         assert len(xyxy) == 300
         assert scores.min() >= 0.5 + (n - 300) / (2 * n)
 
@@ -452,7 +452,7 @@ class TestParseE2E:
         output[0, :, :4] = [10, 20, 110, 120]
         output[0, :, 4] = np.linspace(0.5, 0.9, n)  # ascending, all above conf
         output[0, :, 5] = 2
-        (xyxy, scores, class_ids), = parse_e2e(output, conf=0.25)
+        (xyxy, scores, _class_ids), = parse_e2e(output, conf=0.25)
         assert len(xyxy) == 300
         # Kept the top-300 by score (the tail of the ascending ramp).
         threshold = np.float32(np.linspace(0.5, 0.9, n)[-300])
