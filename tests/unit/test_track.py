@@ -215,6 +215,39 @@ def test_lost_ttl_finishes_exactly_once() -> None:
 
 
 # ---------------------------------------------------------------------
+# Golden scenario 6: an unconfirmed blip dies on its first miss and
+# cannot hijack a later, unrelated vehicle's identity
+# ---------------------------------------------------------------------
+def test_unconfirmed_track_dropped_on_miss_no_hijack() -> None:
+    # min_hits=3 so a single detection stays TENTATIVE; lost_ttl spans the
+    # gap between the blip and the real vehicle, so a lingering ghost would
+    # still be alive to capture it.
+    tracker = create_tracker(TrackerConfig(min_hits=3, lost_ttl=2.0))
+
+    # f0: one spurious high-score detection -> TENTATIVE id=1 (unconfirmed).
+    live = tracker.update([det(100, 100, frame=0)], ts(0), 0)
+    assert [t.track_id for t in live] == [1]
+    assert live[0].state is TrackState.TENTATIVE
+
+    # f1: nothing. The unconfirmed track never reached ACTIVE, so it is
+    # dropped this frame rather than demoted to LOST for the full lost_ttl.
+    live = tracker.update([], ts(1), 1)
+    assert live == []
+    # dropped, not finished: no phantom TRACK_FINISHED summary for a blip
+    assert tracker.pop_finished() == []
+
+    # Later, a genuinely different vehicle drives through the same pixels
+    # (well within lost_ttl of the blip). It must get a fresh id with its
+    # own first_timestamp, not inherit the ghost's identity.
+    live = tracker.update([det(105, 100, frame=40)], ts(40), 40)
+    assert [t.track_id for t in live] == [2]
+    track = live[0]
+    assert track.hits == 1
+    assert track.first_timestamp == pytest.approx(ts(40))
+    assert track.state is TrackState.TENTATIVE
+
+
+# ---------------------------------------------------------------------
 # Supporting guarantees
 # ---------------------------------------------------------------------
 def test_factory_returns_bytetrack() -> None:

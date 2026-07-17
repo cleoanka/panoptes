@@ -15,6 +15,12 @@ any existing tracker codebase:
   frame could never accumulate the ``min_hits`` consecutive hits needed
   to confirm.
 
+The lost buffer (LOST state, kept for ``lost_ttl`` seconds) holds only
+*confirmed* tracks. An unconfirmed track that misses a frame is dropped
+immediately — canonical ByteTrack treats tentative evidence as
+disposable, so a one-frame blip can't linger the full TTL and hijack a
+later detection that really belongs to a new object.
+
 Matching simplification: instead of the Hungarian algorithm we use a
 greedy max-IoU matcher — all admissible pairs sorted by IoU descending,
 accepted while both sides are free. Globally suboptimal in rare
@@ -148,6 +154,14 @@ class ByteTrackTracker(Tracker):
         matched_ids = {entry.track.track_id for entry, _ in matches}
         for entry in entries:
             if entry.track.track_id in matched_ids:
+                continue
+            # ByteTrack's lost buffer holds only *confirmed* tracks. An
+            # unconfirmed (never-ACTIVE) track is tentative evidence: drop it
+            # the frame it misses so a one-frame blip can't linger a full
+            # lost_ttl and hijack a later detection that belongs to a new
+            # object. No _finished entry — it was never a real object.
+            if not entry.confirmed:
+                del self._live[entry.track.track_id]
                 continue
             if entry.track.state is not TrackState.LOST:
                 entry.track.state = TrackState.LOST
