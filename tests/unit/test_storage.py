@@ -450,6 +450,34 @@ async def test_retention_task_first_run_immediate_and_cancellable(tmp_path) -> N
     await db.disconnect()
 
 
+async def test_run_retention_empty_media_dir_never_sweeps_cwd(tmp_path, monkeypatch) -> None:
+    # An empty/blank media_dir (e.g. an exported-but-empty Docker/K8s env var)
+    # must be treated like None: "" -> Path(".") would otherwise rglob the CWD
+    # and unlink every stale file. Guard is `if not self.media_dir` -> rows only.
+    monkeypatch.chdir(tmp_path)
+    victim = tmp_path / "important_old_backup.txt"
+    victim.write_bytes(b"do not delete")
+    old_ts = time.time() - 100 * 86_400.0
+    os.utime(victim, (old_ts, old_ts))
+
+    db = make_db(PrivacyConfig(snapshot_retention_days=30), media_dir="")
+    await db.connect()
+    bus = EventBus()
+    db.attach(bus)
+    bus.publish(
+        Event(type=EventType.SPEEDING, stream_id="s", timestamp=0.0, wall_ts=old_ts, data={})
+    )
+    await db.flush()
+
+    counts = await db.run_retention()
+
+    assert counts["snapshots"] == 0  # no filesystem sweep happened at all
+    assert victim.exists()  # CWD untouched — the data-loss bug does not fire
+    assert counts["events"] == 1  # rows-only path still purges expired rows
+    assert await db.events.query() == []
+    await db.disconnect()
+
+
 def test_missing_async_driver_raises_backend_unavailable(monkeypatch) -> None:
     import sys
 

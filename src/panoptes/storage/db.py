@@ -170,9 +170,11 @@ class Database:
         hourly loop calls this; safe to call ad hoc."""
         from panoptes.storage.retention import purge_once  # circular at module scope
 
-        if self.media_dir is None:
-            # No snapshot root known -> rows only. Passing "" would resolve
-            # to Path(".") and sweep the working directory.
+        if not self.media_dir:
+            # No snapshot root known -> rows only. A blank/empty media_dir
+            # (e.g. an exported-but-empty env var) is treated like None: "" and
+            # "." both resolve to Path(".") and would sweep the working
+            # directory, so any falsy value skips the filesystem sweep.
             privacy = self._privacy.model_copy(update={"snapshot_retention_days": None})
             return await purge_once(self, self._config, privacy, "/nonexistent")
         return await purge_once(self, self._config, self._privacy, self.media_dir)
