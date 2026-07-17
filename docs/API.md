@@ -282,6 +282,7 @@ asyncio.run(main())
 | `q` | string | Plate text, substring match (hashed mode: exact full plate) |
 | `stream` | string | Stream id filter |
 | `since` | float | Minimum `wall_ts` (UNIX seconds) |
+| `until` | float | Maximum `wall_ts` (UNIX seconds) |
 | `limit` | int 1–1000 | Page size (default 100) |
 | `offset` | int ≥ 0 | Pagination offset |
 
@@ -320,6 +321,7 @@ storage `tracks` table.
 | `class` | string | Vehicle class filter (`422` on unknown values) |
 | `plate` | string | Plate text, exact match (hashed mode: exact full plate) |
 | `since` | float | Minimum `last_wall_ts` (UNIX seconds) |
+| `until` | float | Maximum `last_wall_ts` (UNIX seconds) |
 | `limit` | int 1–1000 | Page size (default 100) |
 | `offset` | int ≥ 0 | Pagination offset |
 
