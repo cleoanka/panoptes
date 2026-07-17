@@ -279,7 +279,20 @@ class Homography:
         h = np.linalg.inv(t_dst) @ h_norm @ t_src
         if abs(h[2, 2]) < 1e-12:
             raise ValueError("Degenerate homography (collinear points?)")
-        return cls(h / h[2, 2])
+        h = h / h[2, 2]
+        # Collinear points trip the guard above, but coincident (or otherwise
+        # rank-deficient) correspondences yield a finite h[2, 2] and slip past
+        # it, leaving a singular matrix that later crashes .inverse with a
+        # LinAlgError or silently collapses the whole image onto a line. A
+        # scale-invariant conditioning check (smallest / largest singular
+        # value) rejects them here so callers get one clean ValueError. The
+        # threshold sits in the wide gap between genuinely singular matrices
+        # (reciprocal condition ~1e-34) and valid but ill-conditioned ones
+        # (~1e-15 even under extreme image/ground scale mismatch).
+        singular_values = np.linalg.svd(h, compute_uv=False)
+        if not np.isfinite(h).all() or singular_values[-1] < 1e-20 * singular_values[0]:
+            raise ValueError("Degenerate homography (coincident/collinear points?)")
+        return cls(h)
 
     def project(self, points: np.ndarray | Sequence[Sequence[float]]) -> np.ndarray:
         """Project ``(N, 2)`` image points to ground coordinates."""

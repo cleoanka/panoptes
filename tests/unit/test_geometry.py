@@ -241,3 +241,51 @@ class TestHomographyProjectClamp:
         out = homography.project_point(0.0, 0.0)
         # w = 0 - 5 = -5, so (0, 0) / -5 -> (0, 0).
         assert out == pytest.approx((0.0, 0.0))
+
+
+# --------------------------------------------------------------------
+# Homography.from_points — degeneracy guard (collinear + coincident)
+# --------------------------------------------------------------------
+class TestHomographyFromPointsDegeneracy:
+    def test_coincident_source_points_raise_value_error(self) -> None:
+        # All four image points identical: the h[2, 2] collinear guard is
+        # satisfied (h[2, 2] == 1.0) but the matrix is singular. Without the
+        # conditioning check this builds a homography that crashes .inverse
+        # with a LinAlgError and collapses the whole image onto a line.
+        with pytest.raises(ValueError, match=r"Degenerate homography"):
+            Homography.from_points(
+                [[5, 5], [5, 5], [5, 5], [5, 5]],
+                [[0, 0], [1, 0], [0, 1], [1, 1]],
+            )
+
+    def test_collinear_source_points_still_raise(self) -> None:
+        # Regression guard for the pre-existing collinear case: it must keep
+        # raising and not be masked by the new conditioning branch.
+        with pytest.raises(ValueError, match=r"Degenerate homography"):
+            Homography.from_points(
+                [[0, 0], [10, 0], [20, 0], [30, 0]],
+                [[0, 0], [1, 0], [2, 0], [3, 0]],
+            )
+
+    def test_valid_extreme_scale_mismatch_is_not_rejected(self) -> None:
+        # Over-fix guard: a legitimate homography whose image (pixels) and
+        # ground (metres) scales differ by orders of magnitude is genuinely
+        # ill-conditioned but perfectly invertible. The degeneracy check must
+        # not false-positive on it.
+        homography = Homography.from_points(
+            [[0, 0], [1920, 0], [1920, 1080], [0, 1080]],
+            [[0, 0], [0.02, 0], [0.02, 0.01], [0, 0.01]],
+        )
+        assert np.isfinite(homography.matrix).all()
+        # Round-trips through the ground plane and back to the source corner.
+        ground = homography.project_point(1920.0, 1080.0)
+        back = homography.inverse.project([list(ground)])[0]
+        assert back == pytest.approx((1920.0, 1080.0), abs=1e-3)
+
+    def test_valid_square_homography_survives_guard(self) -> None:
+        # Baseline: a clean pixels->metres square calibration builds fine.
+        homography = Homography.from_points(
+            [[0, 0], [100, 0], [100, 100], [0, 100]],
+            [[0, 0], [10, 0], [10, 10], [0, 10]],
+        )
+        assert homography.project_point(50.0, 50.0) == pytest.approx((5.0, 5.0))
