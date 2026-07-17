@@ -68,12 +68,15 @@ class DetectorConfig(BaseModel):
     backend: Literal["ultralytics", "rfdetr", "onnx", "tensorrt", "mock"] = "ultralytics"
     model: str = "yolo26s.pt"
     device: str = "auto"  # auto | cpu | cuda:0 | mps
-    imgsz: int = 640
+    # Letterbox canvas edge in pixels; must be positive or the synthetic
+    # frame allocation (imgsz*imgsz) and every backend's resize crash deep
+    # in numpy instead of failing cleanly here.
+    imgsz: int = Field(default=640, gt=0)
     conf: float = 0.25
     iou: float = 0.5  # ignored by end-to-end (NMS-free) models such as YOLO26
     half: bool = True  # FP16 hint; onnx/tensorrt bake precision into the artifact at export
     classes: list[VehicleClass] | None = None  # canonical class filter; None = all vehicles
-    max_batch: int = 8
+    max_batch: int = Field(default=8, ge=1)  # frames per infer() call; < 1 is meaningless
     extra: dict[str, Any] = Field(default_factory=dict)  # backend-specific knobs
 
 

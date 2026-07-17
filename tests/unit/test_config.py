@@ -11,6 +11,7 @@ import pytest
 
 from panoptes.core.config import (
     AppConfig,
+    DetectorConfig,
     LineCrossCondition,
     RuleConfig,
     SnapshotConfig,
@@ -153,3 +154,30 @@ def test_speed_defaults_are_valid() -> None:
 def test_stopped_vehicle_negative_thresholds_rejected(kwargs: dict[str, float]) -> None:
     with pytest.raises(ValueError):
         StoppedVehicleConfig(**kwargs)
+
+
+# -- detector numeric bounds ------------------------------------------
+@pytest.mark.parametrize("imgsz", [0, -1, -640])
+def test_detector_imgsz_non_positive_rejected(imgsz: int) -> None:
+    """imgsz <= 0 makes the (imgsz*imgsz) frame allocation and every
+    backend resize crash deep in numpy; ``benchmark --imgsz 0`` must fail
+    fast as a clean config error, not an uncaught traceback."""
+    with pytest.raises(ValueError):
+        DetectorConfig(imgsz=imgsz)
+
+
+@pytest.mark.parametrize("imgsz", [1, 320, 640, 1280])
+def test_detector_imgsz_positive_accepted(imgsz: int) -> None:
+    assert DetectorConfig(imgsz=imgsz).imgsz == imgsz
+
+
+@pytest.mark.parametrize("max_batch", [0, -1])
+def test_detector_max_batch_below_one_rejected(max_batch: int) -> None:
+    with pytest.raises(ValueError):
+        DetectorConfig(max_batch=max_batch)
+
+
+def test_detector_defaults_are_valid() -> None:
+    cfg = DetectorConfig()
+    assert cfg.imgsz == 640
+    assert cfg.max_batch == 8
