@@ -132,14 +132,28 @@ def correct_and_validate(text: str, country: str | None = "TR") -> PlateValidati
     if not 5 <= len(t) <= 10:
         return PlateValidation(text=t, valid=False, country=None, corrected=False)
 
-    # try every legal (n_letters, n_digits) split, safe mappings first
+    # Enumerate *every* legal (aggressive, n_letters) split — not just the
+    # first that validates — and keep the least-corrupting reading. Accepting
+    # the first match let a fewer-letters split win by coercing a genuine
+    # letter into its look-alike digit (e.g. "O6AB1234" -> "06A81234", B->8)
+    # before the no-letter-corruption 2-letter reading was ever tried. The
+    # score is the number of coerced glyphs (chars left untouched cost 0);
+    # ties prefer the safe mapping (aggressive=False sorts first), so a real
+    # letter that already fits its slot is never swapped for a digit.
+    best: tuple[int, bool, str] | None = None
     for aggressive in (False, True):
         for n_letters, dmin, dmax in _TR_PATTERNS:
             n_digits = len(t) - 2 - n_letters
             if not dmin <= n_digits <= dmax:
                 continue
             candidate = _coerce(t, n_letters, aggressive)
-            if candidate is not None and _tr_match(candidate):
-                return PlateValidation(text=candidate, valid=True, country="TR", corrected=True)
+            if candidate is None or not _tr_match(candidate):
+                continue
+            score = sum(a != b for a, b in zip(t, candidate, strict=True))
+            key = (score, aggressive, candidate)
+            if best is None or key < best:
+                best = key
+    if best is not None:
+        return PlateValidation(text=best[2], valid=True, country="TR", corrected=True)
 
     return PlateValidation(text=t, valid=False, country=None, corrected=False)

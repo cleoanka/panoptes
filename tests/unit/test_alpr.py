@@ -303,6 +303,26 @@ class TestCorrectAndValidate:
             assert r.corrected is False
             assert r.text == plate
 
+    def test_least_corrupting_reading_wins_over_first_match(self) -> None:
+        # When a non-letter-slot fix (province O->0) skips the early return,
+        # several legal splits validate. The greedy "first match" accepted a
+        # fewer-letters reading that coerced a REAL 2nd/3rd letter into its
+        # look-alike digit (B->8, S->5, G->6, Z->2) before the no-corruption
+        # reading was ever tried. The minimum-coercion selection must keep the
+        # genuine letters: only the province is fixed, the letter slot is intact.
+        for src, want in (
+            ("O6AB1234", "06AB1234"),  # was faked to 06A81234 (B->8)
+            ("O6BS1234", "06BS1234"),  # was faked to 06B51234 (S->5)
+            ("O6BSG12", "06BSG12"),    # was faked to 06B5612 (S->5, G->6)
+            ("O6ABG12", "06ABG12"),    # was faked to 06A8612 (B->8, G->6)
+            ("3OBZ123", "30BZ123"),    # was faked to 30B2123 (Z->2)
+        ):
+            r = correct_and_validate(src)
+            assert r.valid is True
+            assert r.country == "TR"
+            assert r.corrected is True  # the province glyph is still corrected
+            assert r.text == want  # letters preserved, not swapped to digits
+
     def test_not_over_corrected_when_too_far_from_a_plate(self) -> None:
         # A string with un-mappable glyphs (or a digit in a letter slot that
         # has no look-alike letter) must NOT be forced into a fake plate.
