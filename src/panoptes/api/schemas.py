@@ -99,14 +99,20 @@ def parse_event_types(csv: str | None) -> set[str] | None:
 
     Unknown names are dropped (lenient by design: a dashboard built against
     a newer event taxonomy must not break older servers). Returns ``None``
-    when no filtering was requested.
+    (the "no filter" sentinel) only when no filtering was requested — an
+    empty/absent ``types``. A *non-empty* ``types`` whose names are all
+    unknown yields an empty set, NOT ``None``: the client asked to narrow the
+    feed, so it must get zero events rather than silently falling back to the
+    full firehose.
     """
     if not csv:
         return None
     valid = {t.value for t in EventType}
     wanted = {part.strip().lower() for part in csv.split(",") if part.strip()}
-    wanted &= valid
-    return wanted or None
+    if not wanted:
+        # Only separators/blanks (``,,``, whitespace) — no filter requested.
+        return None
+    return wanted & valid
 
 
 def coerce(model: type[_M], row: Any) -> _M:

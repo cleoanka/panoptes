@@ -33,7 +33,7 @@ from panoptes.api.app import AppState
 from panoptes.api.auth import require_component
 from panoptes.api.jobs import JobRegistry
 from panoptes.api.routes.events import stream_events
-from panoptes.api.schemas import scrub_url
+from panoptes.api.schemas import parse_event_types, scrub_url
 from panoptes.core.config import (
     AppConfig,
     DatabaseConfig,
@@ -414,6 +414,27 @@ def test_scrub_url_residuals_are_documented() -> None:
     assert scrub_url("rtsp://a/b/c@cam.local/stream") == "rtsp://a/b/c@cam.local/stream"
     # Purely-digit pre-'/' password fragment ('user:12' == a host:port shape).
     assert scrub_url("rtsp://user:12/34pw@host:554/live") == "rtsp://user:12/34pw@host:554/live"
+
+
+def test_parse_event_types_distinguishes_no_filter_from_all_invalid() -> None:
+    """``None`` means "no filter"; an all-invalid ``types`` must NOT collapse to it.
+
+    Returning ``None`` for a non-empty but wholly-unknown ``types`` would let a
+    client that asked to narrow the feed silently receive the full event
+    firehose. Such input yields an *empty set* (matches nothing) instead — with
+    the callers' ``wanted is None``/``in wanted`` logic that forwards zero events.
+    """
+    a_valid = next(iter(EventType)).value
+    # No filter requested: absent / empty / separators-only -> None sentinel.
+    assert parse_event_types(None) is None
+    assert parse_event_types("") is None
+    assert parse_event_types(" , , ") is None
+    # Filter requested but every name unknown -> empty set (no events), not None.
+    assert parse_event_types("bogus,unknown") == set()
+    # A mix keeps the known names and drops the unknown ones (lenient).
+    assert parse_event_types(f"{a_valid},bogus") == {a_valid}
+    # Case-insensitive, whitespace-trimmed.
+    assert parse_event_types(f"  {a_valid.upper()}  ") == {a_valid}
 
 
 async def test_metrics_endpoint(app_client) -> None:
