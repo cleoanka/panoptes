@@ -523,6 +523,60 @@ def test_scheduler_close_leaves_queue_to_thread_when_join_times_out():
         sacrificial.join(5.0)
 
 
+def test_scheduler_close_returns_when_detector_wedged_and_queue_full():
+    """close() must return within its join timeout even when the detector is
+    wedged inside infer() AND the bounded queue is saturated by worker threads
+    (one blocked in submit() holding _close_lock). A blocking sentinel put or a
+    blocking submit() put under the lock would deadlock close() indefinitely."""
+    detector = GateDetector()
+    # maxsize = max(4*4, 16) = 16; flood well past it to guarantee saturation.
+    scheduler = InferenceScheduler(detector, max_batch=4, max_delay_ms=5)
+    submitters: list[threading.Thread] = []
+    try:
+        errors: list[Exception] = []
+
+        def submit(value: int) -> None:
+            try:
+                scheduler.submit(_marked_frame(value))
+            except Exception as exc:  # closing scheduler rejects late submits
+                errors.append(exc)
+
+        # The first submit wedges the detector inside infer(); the rest pile up.
+        for value in range(40):
+            t = threading.Thread(target=submit, args=(value,))
+            t.start()
+            submitters.append(t)
+        wait_for(detector.first_call_seen.is_set, message="first batch pickup")
+        # Saturate the queue so a submit() blocks in put() holding _close_lock.
+        wait_for(lambda: scheduler._queue.full(), message="queue saturated")
+
+        # close() from a separate thread must not hang: bound it well under the
+        # 30s default so the test fails fast on the original blocking-put design.
+        elapsed: list[float] = []
+
+        def closer() -> None:
+            started = time.monotonic()
+            scheduler.close(timeout=1.0)
+            elapsed.append(time.monotonic() - started)
+
+        closing = threading.Thread(target=closer)
+        closing.start()
+        closing.join(10.0)
+        assert not closing.is_alive(), "close() deadlocked on wedged detector"
+        assert elapsed and elapsed[0] < 5.0
+
+        # Every blocked/late submit() unblocked into a clean rejection, never
+        # orphaned — so no worker thread is left hanging on a full-queue put.
+        for t in submitters:
+            t.join(5.0)
+        assert not any(t.is_alive() for t in submitters)
+        assert all(isinstance(e, RuntimeError) for e in errors)
+    finally:
+        detector.gate.set()
+        for t in submitters:
+            t.join(5.0)
+
+
 # ---------------------------------------------------------------------
 # annotate
 # ---------------------------------------------------------------------
