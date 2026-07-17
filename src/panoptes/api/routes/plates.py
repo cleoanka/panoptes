@@ -28,8 +28,15 @@ async def search_plates(
         None, description="plate text, substring match (hashed mode: exact full plate)"
     ),
     stream: str | None = Query(None, description="stream id filter"),
-    since: float | None = Query(None, description="minimum wall_ts (UNIX seconds)"),
-    until: float | None = Query(None, description="maximum wall_ts (UNIX seconds)"),
+    # Reject NaN/Infinity: Pydantic defaults allow_inf_nan=True, but a non-finite
+    # bound reaches the repo as ``WHERE wall_ts >= NaN`` which matches nothing
+    # (NaN comparisons are always False), silently returning an empty history.
+    since: float | None = Query(
+        None, description="minimum wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
+    until: float | None = Query(
+        None, description="maximum wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0, description="skip this many rows (pagination)"),
 ) -> list[PlateOut]:

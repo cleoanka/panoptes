@@ -1013,6 +1013,20 @@ async def test_tracks_and_plates_forward_until_bound(app_client) -> None:
     assert app.state.panoptes.db.plates.last_kwargs["until"] == 99.0
 
 
+@pytest.mark.parametrize("path", ["/api/v1/plates", "/api/v1/tracks"])
+@pytest.mark.parametrize("bound", ["since", "until"])
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "Infinity", "1e400"])
+async def test_tracks_and_plates_reject_non_finite_bounds(
+    app_client, path: str, bound: str, value: str
+) -> None:
+    # Mirror the /events guard: NaN/Infinity bounds would reach the repo as
+    # ``WHERE wall_ts >= NaN`` and match nothing, silently returning an empty
+    # history — reject with 422 on the sibling history endpoints too.
+    client, _app = app_client
+    resp = await client.get(path, params={bound: value}, headers=AUTH)
+    assert resp.status_code == 422
+
+
 async def test_tracks_invalid_class_filter(app_client) -> None:
     client, _app = app_client
     assert (

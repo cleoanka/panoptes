@@ -43,8 +43,15 @@ async def list_tracks(
     plate: str | None = Query(
         None, description="plate text, exact at-rest match (hashed mode: exact full plate)"
     ),
-    since: float | None = Query(None, description="minimum last_wall_ts (UNIX seconds)"),
-    until: float | None = Query(None, description="maximum last_wall_ts (UNIX seconds)"),
+    # Reject NaN/Infinity: Pydantic defaults allow_inf_nan=True, but a non-finite
+    # bound reaches the repo as ``WHERE last_wall_ts >= NaN`` which matches nothing
+    # (NaN comparisons are always False), silently returning an empty history.
+    since: float | None = Query(
+        None, description="minimum last_wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
+    until: float | None = Query(
+        None, description="maximum last_wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list[TrackOut]:
