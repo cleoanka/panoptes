@@ -269,7 +269,29 @@ def test_export_with_fake_ultralytics(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.exit_code == 0, _combined_output(result) + repr(result.exception)
     assert "exported: weights/yolo26n.onnx" in result.output
     assert calls["model"] == "yolo26n.pt"
-    assert calls["export"] == {"format": "onnx", "imgsz": 512}
+    assert calls["export"] == {"format": "onnx", "imgsz": 512, "half": False}
+
+
+def test_export_half_forwards_fp16(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: dict = {}
+
+    class FakeYOLO:
+        def __init__(self, model: str) -> None:
+            calls["model"] = model
+
+        def export(self, **kwargs):
+            calls["export"] = kwargs
+            return "weights/yolo26n.engine"
+
+    fake = types.ModuleType("ultralytics")
+    fake.YOLO = FakeYOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", fake)
+
+    result = runner.invoke(
+        app, ["export", "--model", "yolo26n.pt", "--format", "engine", "--half"]
+    )
+    assert result.exit_code == 0, _combined_output(result) + repr(result.exception)
+    assert calls["export"] == {"format": "engine", "imgsz": 640, "half": True}
 
 
 def test_export_rejects_unknown_format() -> None:

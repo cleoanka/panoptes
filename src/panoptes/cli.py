@@ -546,6 +546,9 @@ def export(
     model: str = typer.Option(..., "--model", help="Model weights, e.g. yolo26s.pt."),
     fmt: str = typer.Option("onnx", "--format", help="Target format: onnx | engine."),
     imgsz: int = typer.Option(640, "--imgsz", help="Export image size."),
+    half: bool = typer.Option(
+        False, "--half/--no-half", help="Bake FP16 precision into the exported engine."
+    ),
 ) -> None:
     """Export a model to ONNX or a TensorRT engine (ultralytics backend)."""
     if fmt not in ("onnx", "engine"):
@@ -559,7 +562,7 @@ def export(
             "(AGPL-3.0 — see docs/LICENSING.md)",
         )
         _fail(str(err))
-    out = YOLO(model).export(format=fmt, imgsz=imgsz)
+    out = YOLO(model).export(format=fmt, imgsz=imgsz, half=half)
     print(f"exported: {out}")
 
 
