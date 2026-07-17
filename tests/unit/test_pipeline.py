@@ -689,6 +689,44 @@ def test_open_source_rtsp_falls_back_to_opencv(monkeypatch: pytest.MonkeyPatch):
     source.close()  # never connected; must still be safe
 
 
+def test_opencv_source_connect_but_no_frames_grows_backoff(monkeypatch: pytest.MonkeyPatch):
+    # A camera that ACCEPTS the connection but never delivers a decodable frame
+    # (powered-but-dead stream, auth OK but no media) must still ride the
+    # 1s -> 30s exponential backoff — resetting on open() would pin it at ~1s
+    # forever, a tight reconnect loop + STREAM_ERROR flood.
+    class _DeadCap:
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, prop: int) -> float:
+            return 0.0
+
+        def read(self):
+            return False, None  # opens fine, never yields a frame
+
+        def release(self) -> None:
+            pass
+
+    monkeypatch.setattr(cv2, "VideoCapture", lambda *a, **k: _DeadCap())
+    source = OpenCvSource(StreamConfig(id="s1", source="rtsp://camera.invalid/stream"))
+    monkeypatch.setattr(source._stop, "wait", lambda _t: None)  # no real sleeps
+
+    # error_cb fires at the head of each _backoff, before the delay grows, so it
+    # records the delay about to be applied; stop the loop once we have enough.
+    applied: list[float] = []
+
+    def _record(_message: str) -> None:
+        applied.append(source._backoff_s)
+        if len(applied) >= 6:
+            source.request_stop()
+
+    source.error_cb = _record
+    with pytest.raises(StopIteration):
+        next(iter(source))
+    source.close()
+    assert applied == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0]
+
+
 # ---------------------------------------------------------------------
 # end-to-end: process_video and live worker lifecycle
 # ---------------------------------------------------------------------
