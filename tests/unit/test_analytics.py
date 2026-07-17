@@ -283,6 +283,48 @@ class TestZoneMonitor:
         assert events[0].data["dwell_s"] == pytest.approx(3.0)
         assert monitor.occupancy() == 0
 
+    def test_class_flip_out_of_filter_frees_occupancy(self) -> None:
+        # A CAR enters a car-only zone, then ByteTrack's class vote flips it
+        # to TRUCK mid-dwell: the exit must fire so occupancy never drifts.
+        cfg = ZONE.model_copy(update={"classes": [VehicleClass.CAR]})
+        monitor = ZoneMonitor(cfg)
+        track = make_track(cls=VehicleClass.CAR)
+        step(track, 100.0, 100.0, 0.5)
+        events = monitor.update([track], 0.5, 1_000_000.5)
+        assert [e.type for e in events] == [EventType.ZONE_ENTERED]
+        assert monitor.occupancy() == 1
+
+        # Class votes out of the filter while still geometrically inside.
+        track.vehicle_class = VehicleClass.TRUCK
+        step(track, 100.0, 100.0, 1.5)
+        events = monitor.update([track], 1.5, 1_000_001.5)
+        assert [e.type for e in events] == [EventType.ZONE_EXITED]
+        assert events[0].data["dwell_s"] == pytest.approx(1.0)
+        assert monitor.occupancy() == 0
+        assert "z1" not in track.data[ZONE_STATE_KEY]
+
+        # And it never re-enters as long as it stays a filtered-out class.
+        step(track, 100.0, 100.0, 2.0)
+        assert monitor.update([track], 2.0, 1_000_002.0) == []
+        assert monitor.occupancy() == 0
+
+    def test_class_flip_into_filter_inside_zone_enters(self) -> None:
+        # The mirror case: a TRUCK sitting inside a car-only zone is ignored
+        # until its class votes to CAR, which must then count as an entry.
+        cfg = ZONE.model_copy(update={"classes": [VehicleClass.CAR]})
+        monitor = ZoneMonitor(cfg)
+        track = make_track(cls=VehicleClass.TRUCK)
+        step(track, 100.0, 100.0, 0.5)
+        assert monitor.update([track], 0.5, 1_000_000.5) == []
+        assert monitor.occupancy() == 0
+        assert "z1" not in track.data.get(ZONE_STATE_KEY, {})
+
+        track.vehicle_class = VehicleClass.CAR
+        step(track, 100.0, 100.0, 1.0)
+        events = monitor.update([track], 1.0, 1_000_001.0)
+        assert [e.type for e in events] == [EventType.ZONE_ENTERED]
+        assert monitor.occupancy() == 1
+
 
 # ---------------------------------------------------------------------
 # rules engine
