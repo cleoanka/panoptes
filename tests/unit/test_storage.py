@@ -580,3 +580,45 @@ async def test_per_event_fallback_requeues_on_transient_error() -> None:
     rows = await db.events.query(stream="cam1", type="line_crossed")
     assert {r["timestamp"] for r in rows} == {0.0, 1.0, 2.0}
     await db.disconnect()
+
+
+async def test_per_event_fallback_drops_unbuildable_event() -> None:
+    # A poison event whose row cannot even be BUILT — a non-numeric confidence
+    # makes _plate_read_row's float() raise ValueError BEFORE any DB round-trip.
+    # That per-row build error must be classified as poison (dropped-with-log),
+    # NOT re-queued as transient, so the buffer advances and the surrounding
+    # valid events still persist. Regression guard: the pre-fix code caught only
+    # (IntegrityError, DataError), so the ValueError hit `except BaseException`,
+    # got re-queued and wedged the buffer forever, losing everything behind it.
+    from panoptes.storage.db import _FLUSH_FAILURES_BEFORE_FALLBACK
+
+    db = make_db(flush_interval=60.0)  # drive flush() by hand
+    await db.connect()
+    now = time.time()
+    poison = Event(
+        type=EventType.PLATE_READ,
+        stream_id="cam1",
+        timestamp=1.0,
+        wall_ts=now,
+        track_id=7,
+        data={"plate": RAW_PLATE, "confidence": "not-a-number", "valid": True},
+    )
+    valid = Event(
+        type=EventType.SPEEDING,
+        stream_id="cam1",
+        timestamp=2.0,
+        wall_ts=now,
+        data={},
+    )
+    with db._buffer_lock:
+        db._buffer = [poison, valid]
+    db._flush_failures = _FLUSH_FAILURES_BEFORE_FALLBACK  # arm the fallback
+
+    await db.flush()
+
+    # the unbuildable event is dropped; the valid one behind it still persisted
+    rows = await db.events.query(stream="cam1")
+    assert {r["type"] for r in rows} == {"speeding"}
+    with db._buffer_lock:
+        assert db._buffer == []  # nothing wedged / re-queued
+    await db.disconnect()

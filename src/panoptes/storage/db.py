@@ -277,17 +277,42 @@ class Database:
                     # stream's reused track ids can never overwrite history.
                     session.add(self._track_row(event))
 
+    def _build_rows(self, event: Event) -> None:
+        """Build (and discard) an event's ORM rows to surface a row-builder
+        error *before* the DB round-trip. The builders coerce free-form
+        ``event.data`` (``float``/``int`` casts), so a malformed value raises
+        ``ValueError``/``TypeError`` here rather than inside ``_flush_batch``'s
+        transaction — letting the per-event fallback classify it as permanent
+        per-row poison instead of a transient DB failure."""
+        self._event_row(event)
+        if event.type == EventType.PLATE_READ:
+            self._plate_read_row(event)
+        elif event.type == EventType.TRACK_FINISHED and event.track_id is not None:
+            self._track_row(event)
+
     async def _flush_per_event(self, batch: list[Event]) -> None:
         """Poison-batch fallback: one transaction per event so valid events
         persist and only the genuinely poison ones are dropped.
 
-        Only a per-row/permanent error (``IntegrityError`` / ``DataError`` —
-        constraint violation, oversized/bad column) is treated as poison and
-        dropped with a log. Any other failure (``OperationalError`` "database
-        is locked", disconnect, disk full) is transient: the remaining slice
-        is re-queued and re-raised so the next flush retries it, mirroring
-        ``_flush_batch``'s contract that a failed pass never loses events."""
+        Two kinds of per-row poison are dropped-with-log: a row-builder error
+        (``ValueError`` / ``TypeError`` from coercing malformed ``event.data``
+        *before* the DB) and a permanent DB error (``IntegrityError`` /
+        ``DataError`` — constraint violation, oversized/bad column). Probing
+        the build up front keeps that step off the requeue path, so a poison
+        event that cannot even be row-built is isolated and the buffer
+        advances instead of wedging on it forever. Any other failure
+        (``OperationalError`` "database is locked", disconnect, disk full) is
+        transient: the remaining slice is re-queued and re-raised so the next
+        flush retries it, mirroring ``_flush_batch``'s contract that a failed
+        pass never loses events."""
         for index, event in enumerate(batch):
+            try:
+                self._build_rows(event)
+            except (ValueError, TypeError):
+                logger.exception(
+                    "dropping unbuildable event %s (%s)", event.id, event.type
+                )
+                continue
             try:
                 await self._flush_batch([event])
             except (IntegrityError, DataError):
