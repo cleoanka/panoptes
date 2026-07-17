@@ -346,6 +346,15 @@ async def test_config_redacts_secrets(app_client) -> None:
             "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
         ),
         ("https://cdn.example.com:443/@handle", "https://cdn.example.com:443/@handle"),
+        # Bracketed IPv6 authority: the inner ':' is the host, NOT a credential,
+        # so a credential-FREE IPv6 URL with a path/query '@' must pass through
+        # (Round-9 over-mask regression: _HOST_PORT_RE forbade ':' in the host).
+        ("rtsp://[::1]:554/live@2x", "rtsp://[::1]:554/live@2x"),
+        ("rtsp://[::1]/onvif@p", "rtsp://[::1]/onvif@p"),
+        ("rtsp://[2001:db8::1]:554/live@2x", "rtsp://[2001:db8::1]:554/live@2x"),
+        # A credentialed IPv6 authority still masks (authority '@' wins).
+        ("rtsp://user:pass@[::1]:554/live", "rtsp://***@[::1]:554/live"),
+        ("rtsp://admin:secret@[2001:db8::1]:554/live@2x", "rtsp://***@[2001:db8::1]:554/live@2x"),
         # No credentials / not a URL: passed through unchanged.
         ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
         ("https://api.local/v1@ref", "https://api.local/v1@ref"),
@@ -356,9 +365,39 @@ def test_scrub_url_masks_userinfo(url: str, expected: str) -> None:
     scrubbed = scrub_url(url)
     assert scrubbed == expected
     # Whatever password bytes were present must be fully gone.
-    for secret in ("pass", "p@ss", "tok", "Xy/9$kQ", "p/w", "s:er:p/w"):
+    for secret in ("pass", "p@ss", "tok", "Xy/9$kQ", "p/w", "s:er:p/w", "secret"):
         if f":{secret}@" in url or f"//{secret}@" in url or f"/{secret}@" in url:
             assert secret not in scrubbed
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        # Some driver URLs carry the secret as a ``?password=`` query param
+        # rather than userinfo; those keys are redacted too (value up to '&'/'#').
+        (
+            "postgresql://host/db?password=secret&sslmode=require",
+            "postgresql://host/db?password=***&sslmode=require",
+        ),
+        ("mysql://host/db?user=admin&password=hunter2", "mysql://host/db?user=admin&password=***"),
+        # Userinfo AND a query-string secret in the same URL: both go.
+        ("postgresql://user:pass@host/db?password=secret", "postgresql://***@host/db?password=***"),
+        # All recognised keys, case-insensitive, value ends at '&'/'#'.
+        (
+            "postgresql://host/db?pwd=x&token=abc&secret=q#frag",
+            "postgresql://host/db?pwd=***&token=***&secret=***#frag",
+        ),
+        ("mysql://host/db?PassWord=Up", "mysql://host/db?PassWord=***"),
+        # A key that merely ends in ``password`` is NOT a credential key.
+        ("https://host/x?app_password=leak", "https://host/x?app_password=leak"),
+    ],
+)
+def test_scrub_url_masks_query_secrets(url: str, expected: str) -> None:
+    scrubbed = scrub_url(url)
+    assert scrubbed == expected
+    for secret in ("secret", "hunter2", "abc", "Up"):
+        if f"={secret}" in url and "app_password" not in url:
+            assert f"={secret}" not in scrubbed
 
 
 def test_scrub_url_residuals_are_documented() -> None:

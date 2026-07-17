@@ -38,11 +38,21 @@ _M = TypeVar("_M", bound=BaseModel)
 # does (``openssl rand -base64`` emits '/'), leaking the credential verbatim.
 _SCHEME_RE = re.compile(r"^(\w[\w+.-]*://)(.*)$", re.DOTALL)
 # A bare ``host:port`` authority — the ':' is a port, NOT a credential marker.
-_HOST_PORT_RE = re.compile(r"^[^:@/?#]+:\d+$")
+# A bracketed IPv6 literal (``[::1]``, ``[2001:db8::1]:554``) is a host too, so
+# its inner ':' must not read as a credential separator either (with or without
+# a trailing port).
+_HOST_PORT_RE = re.compile(r"^(?:\[[0-9A-Fa-f:]+\](?::\d+)?|[^:@/?#]+:\d+)$")
+# Some driver URLs carry the secret as a query parameter (``?password=...``)
+# instead of userinfo; mask known credential keys, the value running up to the
+# next '&' or the fragment '#'. The leading ``[?&]`` anchors on a real key start
+# so a substring like ``app_password=`` is not matched.
+_QUERY_SECRET_RE = re.compile(
+    r"([?&](?:password|passwd|pwd|secret|token)=)[^&#]*", re.IGNORECASE
+)
 
 
 def scrub_url(url: str) -> str:
-    """Mask ``user:password@`` credentials embedded in a URL."""
+    """Mask ``user:password@`` credentials and ``?password=`` query secrets."""
     match = _SCHEME_RE.match(url)
     if not match:
         return url
@@ -51,12 +61,13 @@ def scrub_url(url: str) -> str:
     # userinfo runs up to the LAST such '@', so an unencoded '@' in the password
     # (``user:p@ss@host``) is masked whole. Otherwise a raw '/' in the password
     # (RFC-3986-illegal but accepted by ffmpeg/asyncpg) has pushed the '@' past
-    # that delimiter, so a tail '@' is the true userinfo terminator.
+    # that delimiter, so a tail '@' is the true userinfo terminator. A '@'
+    # sitting purely in the query/fragment is handled last by the query masker.
     authority_end = min((i for i, c in enumerate(rest) if c in "/?#"), default=len(rest))
     authority = rest[:authority_end]
     at = authority.rfind("@")
     if at != -1:
-        return f"{scheme}***@{rest[at + 1:]}"
+        return _mask_query_secrets(f"{scheme}***@{rest[at + 1:]}")
     tail_at = rest.find("@", authority_end)
     if tail_at != -1:
         # Fail CLOSED on a tail '@' only when the text before it is genuine
@@ -74,8 +85,13 @@ def scrub_url(url: str) -> str:
             first_slash = userinfo.index("/")  # tail_at > authority_end ⇒ a '/' exists
             before, after = userinfo[:first_slash], userinfo[first_slash + 1 :]
             if ":" in after or (":" in before and not _HOST_PORT_RE.match(before)):
-                return f"{scheme}***@{rest[tail_at + 1:]}"
-    return url
+                return _mask_query_secrets(f"{scheme}***@{rest[tail_at + 1:]}")
+    return _mask_query_secrets(url)
+
+
+def _mask_query_secrets(url: str) -> str:
+    """Redact the value of any ``?password=``/``&token=`` credential query key."""
+    return _QUERY_SECRET_RE.sub(r"\1***", url)
 
 
 def parse_event_types(csv: str | None) -> set[str] | None:
@@ -216,8 +232,9 @@ class ConfigOut(BaseModel):
     """Full configuration dump with secrets redacted.
 
     Redacted: ``server.api_keys``, ``privacy.hash_salt``, webhook action
-    URLs and header values, and any ``user:password@`` credentials inside
-    stream sources / the database URL.
+    URLs and header values, and any credentials inside stream sources / the
+    database URL (both ``user:password@`` userinfo and ``?password=`` query
+    parameters).
     """
 
     model_config = ConfigDict(extra="allow")

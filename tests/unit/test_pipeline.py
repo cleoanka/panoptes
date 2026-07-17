@@ -993,6 +993,17 @@ def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
             "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
             "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
         ),
+        # Bracketed IPv6 host: credential-free path/query '@' passes through, but
+        # a real userinfo credential still masks (mirrors the canonical cases).
+        ("rtsp://[::1]:554/live@2x", "rtsp://[::1]:554/live@2x"),
+        ("rtsp://[2001:db8::1]:554/live@2x", "rtsp://[2001:db8::1]:554/live@2x"),
+        ("rtsp://user:pass@[::1]:554/live", "rtsp://***@[::1]:554/live"),
+        # A '?password='/'?token=' query secret is redacted alongside userinfo.
+        (
+            "postgresql://host/db?password=secret&sslmode=require",
+            "postgresql://host/db?password=***&sslmode=require",
+        ),
+        ("postgresql://user:pass@host/db?pwd=secret", "postgresql://***@host/db?pwd=***"),
         # A '@' in the path (not the authority) is left untouched.
         ("https://api.local/v1@ref", "https://api.local/v1@ref"),
         ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
