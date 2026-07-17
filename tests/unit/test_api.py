@@ -330,6 +330,22 @@ async def test_config_redacts_secrets(app_client) -> None:
             "postgresql+asyncpg://panoptes:p/w@db.internal:5432/panoptes",
             "postgresql+asyncpg://***@db.internal:5432/panoptes",
         ),
+        # A '/'-in-password with the credential ':' AFTER that '/' must still
+        # fail CLOSED (the ':' lands past the first authority delimiter).
+        ("rtsp://u/s:er:p/w@host/stream", "rtsp://***@host/stream"),
+        # Round-7 over-mask regression: a bare host:port colon is NOT a
+        # credential, so a credential-FREE URL with a port AND a path/query '@'
+        # must pass through UNCHANGED (was mangled to 'scheme://***@<tail>').
+        ("rtsp://cam.local:554/live@2x", "rtsp://cam.local:554/live@2x"),
+        ("https://host:8080/path@ref", "https://host:8080/path@ref"),
+        ("https://api:443/redirect?u=a@b.com", "https://api:443/redirect?u=a@b.com"),
+        ("https://api.local:8443/v1@ref", "https://api.local:8443/v1@ref"),
+        ("rtsp://camera.local:554/onvif@profile", "rtsp://camera.local:554/onvif@profile"),
+        (
+            "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
+            "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
+        ),
+        ("https://cdn.example.com:443/@handle", "https://cdn.example.com:443/@handle"),
         # No credentials / not a URL: passed through unchanged.
         ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
         ("https://api.local/v1@ref", "https://api.local/v1@ref"),
@@ -340,9 +356,25 @@ def test_scrub_url_masks_userinfo(url: str, expected: str) -> None:
     scrubbed = scrub_url(url)
     assert scrubbed == expected
     # Whatever password bytes were present must be fully gone.
-    for secret in ("pass", "p@ss", "tok", "Xy/9$kQ", "p/w"):
-        if f":{secret}@" in url or f"//{secret}@" in url:
+    for secret in ("pass", "p@ss", "tok", "Xy/9$kQ", "p/w", "s:er:p/w"):
+        if f":{secret}@" in url or f"//{secret}@" in url or f"/{secret}@" in url:
             assert secret not in scrubbed
+
+
+def test_scrub_url_residuals_are_documented() -> None:
+    """Exotic '/'-in-userinfo shapes that stay UNMASKED (accepted residual).
+
+    Both are syntactically indistinguishable from a credential-free
+    ``host:port/path@`` URL, so masking them would re-introduce the Round-7
+    over-mask regression on the ubiquitous camera/DB URL shape. Neither can
+    leak a *password*: a colon-less username has no password field, and a
+    purely-digit pre-'/' fragment reads as a ``host:port`` authority.
+    """
+    # Colon-less '/'-bearing username (leaks only a bare username, never a pass).
+    assert scrub_url("rtsp://us/er@cam.local:554/stream") == "rtsp://us/er@cam.local:554/stream"
+    assert scrub_url("rtsp://a/b/c@cam.local/stream") == "rtsp://a/b/c@cam.local/stream"
+    # Purely-digit pre-'/' password fragment ('user:12' == a host:port shape).
+    assert scrub_url("rtsp://user:12/34pw@host:554/live") == "rtsp://user:12/34pw@host:554/live"
 
 
 async def test_metrics_endpoint(app_client) -> None:

@@ -37,6 +37,8 @@ _M = TypeVar("_M", bound=BaseModel)
 # URL) the moment the userinfo holds a '/', which a base64/random password often
 # does (``openssl rand -base64`` emits '/'), leaking the credential verbatim.
 _SCHEME_RE = re.compile(r"^(\w[\w+.-]*://)(.*)$", re.DOTALL)
+# A bare ``host:port`` authority — the ':' is a port, NOT a credential marker.
+_HOST_PORT_RE = re.compile(r"^[^:@/?#]+:\d+$")
 
 
 def scrub_url(url: str) -> str:
@@ -49,16 +51,30 @@ def scrub_url(url: str) -> str:
     # userinfo runs up to the LAST such '@', so an unencoded '@' in the password
     # (``user:p@ss@host``) is masked whole. Otherwise a raw '/' in the password
     # (RFC-3986-illegal but accepted by ffmpeg/asyncpg) has pushed the '@' past
-    # that delimiter: if the authority still shows a ':' credential marker and an
-    # '@' follows, we fail CLOSED and mask up to that first '@' rather than leak.
+    # that delimiter, so a tail '@' is the true userinfo terminator.
     authority_end = min((i for i, c in enumerate(rest) if c in "/?#"), default=len(rest))
     authority = rest[:authority_end]
     at = authority.rfind("@")
     if at != -1:
         return f"{scheme}***@{rest[at + 1:]}"
     tail_at = rest.find("@", authority_end)
-    if tail_at != -1 and ":" in authority:
-        return f"{scheme}***@{rest[tail_at + 1:]}"
+    if tail_at != -1:
+        # Fail CLOSED on a tail '@' only when the text before it is genuine
+        # userinfo, not ``host[:port]/path`` whose path merely contains an '@'.
+        # A '@' behind a '?'/'#' is in the query/fragment, never the userinfo;
+        # otherwise a credential ':' is one that survives after stripping a bare
+        # ``host:port`` prefix (so ``cam.local:554/x@`` passes through while
+        # ``user:p/w@`` masks). Residual (accepted, documented): a colon-less
+        # '/'-bearing username (``us/er@host``, no password) and a purely-digit
+        # pre-'/' password fragment (``user:12/pw@``, indistinguishable from a
+        # ``host:port`` authority) still pass through — masking either would
+        # over-mask the ubiquitous credential-free ``host:port/path@`` shape.
+        userinfo = rest[:tail_at]
+        if "?" not in userinfo and "#" not in userinfo:
+            first_slash = userinfo.index("/")  # tail_at > authority_end ⇒ a '/' exists
+            before, after = userinfo[:first_slash], userinfo[first_slash + 1 :]
+            if ":" in after or (":" in before and not _HOST_PORT_RE.match(before)):
+                return f"{scheme}***@{rest[tail_at + 1:]}"
     return url
 
 

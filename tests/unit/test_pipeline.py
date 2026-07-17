@@ -981,6 +981,18 @@ def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
             "rtsp://admin:Xy/9$kQ@10.0.0.5:554/Streaming/Channels/101",
             "rtsp://***@10.0.0.5:554/Streaming/Channels/101",
         ),
+        # A '/'-in-password with the credential ':' AFTER that '/' still masks.
+        ("rtsp://u/s:er:p/w@host/stream", "rtsp://***@host/stream"),
+        # Round-7 over-mask regression: a bare host:port colon is NOT a
+        # credential, so a credential-FREE port URL with a path/query '@' passes
+        # through unchanged (mirrors the canonical schemas.py cases exactly).
+        ("rtsp://cam.local:554/live@2x", "rtsp://cam.local:554/live@2x"),
+        ("https://host:8080/path@ref", "https://host:8080/path@ref"),
+        ("https://api:443/redirect?u=a@b.com", "https://api:443/redirect?u=a@b.com"),
+        (
+            "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
+            "postgresql+asyncpg://db.internal:5432/panoptes?opt=a@b",
+        ),
         # A '@' in the path (not the authority) is left untouched.
         ("https://api.local/v1@ref", "https://api.local/v1@ref"),
         ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
