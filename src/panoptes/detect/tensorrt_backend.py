@@ -28,6 +28,7 @@ from panoptes.detect._postprocess import (
     preprocess_batch,
 )
 from panoptes.detect.base import Detector
+from panoptes.detect.onnx_backend import _coerce_names
 
 __all__ = ["TensorRTDetector"]
 
@@ -93,7 +94,7 @@ class TensorRTDetector(Detector):
         self._output_dtype = self._np_dtype(engine.get_tensor_dtype(self._output_name))
         extra_names = config.extra.get("names")
         if isinstance(extra_names, dict):
-            self._names: dict[int, str] = {int(k): str(v) for k, v in extra_names.items()}
+            self._names: dict[int, str] = _coerce_names(extra_names)
         else:
             self._names = dict(COCO80_NAMES)
         self._buffers: dict[str, tuple[int, int]] = {}  # key -> (device ptr, capacity)

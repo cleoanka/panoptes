@@ -845,6 +845,15 @@ class TestOnnxBackend:
         with pytest.raises(ConfigError, match="not found"):
             create_detector(config)
 
+    def test_extra_names_non_int_keys_falls_back_to_coco80(self, monkeypatch, tmp_path):
+        # YAML mappings arrive with string keys; a non-int-coercible key in
+        # config.extra["names"] must fall back, not crash detector construction
+        recorder: dict = {}
+        install_fake_onnxruntime(monkeypatch, recorder, np.zeros((1, 300, 6), np.float32))
+        config = self.onnx_config(tmp_path, extra={"names": {"car": "vehicle"}})
+        detector = create_detector(config)
+        assert detector._names == COCO80_NAMES
+
 
 class TestParseNamesMetadata:
     def test_dict_literal(self):
@@ -859,3 +868,10 @@ class TestParseNamesMetadata:
 
     def test_garbage_falls_back_to_coco80(self):
         assert parse_names_metadata("not a dict at all {{{") == COCO80_NAMES
+
+    def test_dict_with_non_int_keys_falls_back_to_coco80(self):
+        # a parseable dict whose keys aren't int-coercible must honour the
+        # documented fallback, not escape with a raw ValueError/TypeError
+        assert parse_names_metadata("{'car': 'vehicle'}") == COCO80_NAMES
+        assert parse_names_metadata("{None: 1}") == COCO80_NAMES
+        assert parse_names_metadata("{(1, 2): 'x'}") == COCO80_NAMES
