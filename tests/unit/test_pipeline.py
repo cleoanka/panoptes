@@ -46,13 +46,14 @@ from panoptes.core.types import (
     TrackState,
     VehicleClass,
 )
+from panoptes.observability import metrics
 from panoptes.pipeline import PipelineManager
 from panoptes.pipeline.annotate import annotate
 from panoptes.pipeline.governor import FrameGovernor
 from panoptes.pipeline.scheduler import _SENTINEL, InferenceScheduler
 from panoptes.pipeline.snapshots import SnapshotSaver
 from panoptes.pipeline.source import OpenCvSource, PyAvSource, open_source
-from panoptes.pipeline.worker import StreamWorker
+from panoptes.pipeline.worker import StreamWorker, _stream_labelled_collectors
 
 # ---------------------------------------------------------------------
 # helpers / fakes
@@ -882,6 +883,47 @@ def test_process_video_releases_model_sessions_on_teardown(
     assert closed == ["attributes"]
     # the real AlprPipeline has no close(): its native model refs are dropped
     assert alprs and alprs[0]._detector is None and alprs[0]._ocr is None
+
+
+def _stream_metric_children(stream_id: str) -> int:
+    """Count live prometheus label children keyed on ``stream_id`` across
+    every stream-labelled collector (frames, tracks, events, plates, fps)."""
+    total = 0
+    for collector in _stream_labelled_collectors():
+        stream_at = collector._labelnames.index("stream")
+        total += sum(1 for key in collector._metrics if key[stream_at] == stream_id)
+    return total
+
+
+def test_process_video_removes_stream_metric_labels_on_teardown(
+    tmp_path: Path, fake_components
+):
+    """A finished batch job must drop its per-stream metric label children.
+
+    Batch jobs get an effectively-unbounded uuid-derived stream id, so leaving
+    their prometheus children behind grows the registry (and every /metrics
+    scrape) without bound. finalize() removes them; a config stream's children
+    must survive untouched.
+    """
+    video = write_video(tmp_path / "input.mp4")
+    config = AppConfig(streams=[], server=ServerConfig(media_dir=str(tmp_path / "media")))
+    manager = PipelineManager(config, EventBus())
+
+    job_id = "job-deadbeef"
+    survivor = "cam-config-1"
+    metrics.FRAMES_PROCESSED.labels(stream=survivor).inc()  # a config stream must be kept
+    assert _stream_metric_children(job_id) == 0
+
+    try:
+        manager.process_video(video, StreamConfig(id=job_id, source=str(video)))
+    finally:
+        manager.stop()
+
+    # the job touched frames/tracks/events children while running, all now gone
+    assert _stream_metric_children(job_id) == 0
+    assert job_id.encode() not in metrics.render_metrics()[0]
+    # a config-declared stream's children are left intact
+    assert _stream_metric_children(survivor) == 1
 
 
 def test_release_processor_failure_logs_the_exception(

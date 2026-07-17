@@ -18,6 +18,7 @@ and the modules can be substituted in tests.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import threading
@@ -49,6 +50,50 @@ logger = logging.getLogger(__name__)
 _JPEG_REFRESH_MIN_INTERVAL_S = 0.1  # latest_jpeg refreshed at most 10/s
 _FPS_WINDOW_S = 2.0                 # rolling FPS horizon for status()
 _STOP_JOIN_TIMEOUT_S = 10.0
+
+# Every prometheus metric carrying a per-stream ``stream`` label. Batch jobs
+# get an effectively-unbounded uuid-derived id, so their label children must
+# be removed when the job finishes or the registry (and every /metrics scrape)
+# grows without bound. prometheus_client never GCs children on its own.
+_STREAM_LABELLED_METRICS = (
+    "panoptes_frames_processed_total",
+    "panoptes_frames_dropped_total",
+    "panoptes_active_tracks",
+    "panoptes_events_total",
+    "panoptes_plate_reads_total",
+    "panoptes_stream_fps",
+)
+
+
+def _stream_labelled_collectors() -> list[Any]:
+    """Prometheus collectors from :data:`_STREAM_LABELLED_METRICS` that exist
+    and carry a ``stream`` label (empty when observability is absent).
+
+    Resolves against ``panoptes.observability.metrics`` the same defensive way
+    as :func:`~panoptes.pipeline.scheduler.metric_handle` — matching on the
+    collector's ``_name`` (the python client strips a trailing ``_total``) —
+    because a metric child can only be removed through its parent collector,
+    which the ``_MetricHandle`` facade does not expose.
+    """
+    try:
+        from panoptes.observability import metrics
+    except Exception:
+        return []
+    wanted = {n: n.removesuffix("_total") for n in _STREAM_LABELLED_METRICS}
+    names = set(wanted) | set(wanted.values())
+    collectors: list[Any] = []
+    try:
+        for obj in vars(metrics).values():
+            name = getattr(obj, "_name", None)
+            if (
+                isinstance(name, str)
+                and name in names
+                and "stream" in getattr(obj, "_labelnames", ())
+            ):
+                collectors.append(obj)
+    except Exception:
+        return []
+    return collectors
 
 # RTSP/HTTP camera sources routinely embed credentials (rtsp://user:pass@host),
 # so mask them before a source URL enters lifecycle-event data — those events
@@ -253,6 +298,32 @@ class StreamProcessor:
             self._emit(generated, None, tracks)
         self.live_tracks = []
         self._m_active.set(0.0)
+        # Last metric touch for this stream: drop its label children so a
+        # long-lived server processing many (uuid-keyed) batch jobs does not
+        # leak metric series. Must run *after* every set()/inc() above, which
+        # would otherwise re-create the child it just removed.
+        self._remove_stream_metrics()
+
+    def _remove_stream_metrics(self) -> None:
+        """Remove this stream's label children from the shared collectors.
+
+        Best-effort and guarded like every other metric touch (metrics must
+        never break the pipeline): resolves each collector by name, then removes
+        the label tuples whose ``stream`` label matches this stream — covering
+        the dynamic ``type``/``valid`` label combinations of the event and plate
+        counters that ``.labels()`` cannot enumerate ahead of time. Uses the
+        prometheus_client child map directly because it exposes no public
+        "remove every child for one label value" API.
+        """
+        stream_id = self._stream_cfg.id
+        for collector in _stream_labelled_collectors():
+            labelnames = getattr(collector, "_labelnames", ())
+            stream_at = labelnames.index("stream")  # guaranteed by the resolver
+            for values in [
+                v for v in getattr(collector, "_metrics", {}) if v[stream_at] == stream_id
+            ]:
+                with contextlib.suppress(Exception):
+                    collector.remove(*values)
 
     def summary(self) -> dict[str, Any]:
         return self._analytics.summary()
