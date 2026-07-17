@@ -31,18 +31,34 @@ __all__ = [
 
 _M = TypeVar("_M", bound=BaseModel)
 
-# scheme://userinfo@rest — the userinfo part of RTSP/DB URLs carries credentials.
-# ``userinfo`` matches greedily up to the LAST '@' before the host so an
-# unencoded '@' in the password (e.g. ``user:p@ss@host``) is fully masked and
-# does not leak; ``[^@/]`` anchors the host so a '@' in the path is left alone.
-_USERINFO_RE = re.compile(r"^(\w[\w+.-]*://)([^/]+)@([^@/]*.*)$")
+# scheme://rest — the userinfo part of RTSP/DB URLs carries credentials. We
+# anchor on the scheme and locate the authority explicitly rather than matching
+# the whole URL in one regex: a full-match approach fails OPEN (returns the raw
+# URL) the moment the userinfo holds a '/', which a base64/random password often
+# does (``openssl rand -base64`` emits '/'), leaking the credential verbatim.
+_SCHEME_RE = re.compile(r"^(\w[\w+.-]*://)(.*)$", re.DOTALL)
 
 
 def scrub_url(url: str) -> str:
     """Mask ``user:password@`` credentials embedded in a URL."""
-    match = _USERINFO_RE.match(url)
-    if match:
-        return f"{match.group(1)}***@{match.group(3)}"
+    match = _SCHEME_RE.match(url)
+    if not match:
+        return url
+    scheme, rest = match.group(1), match.group(2)
+    # The authority ends at the first '/', '?' or '#'. When it holds an '@' the
+    # userinfo runs up to the LAST such '@', so an unencoded '@' in the password
+    # (``user:p@ss@host``) is masked whole. Otherwise a raw '/' in the password
+    # (RFC-3986-illegal but accepted by ffmpeg/asyncpg) has pushed the '@' past
+    # that delimiter: if the authority still shows a ':' credential marker and an
+    # '@' follows, we fail CLOSED and mask up to that first '@' rather than leak.
+    authority_end = min((i for i, c in enumerate(rest) if c in "/?#"), default=len(rest))
+    authority = rest[:authority_end]
+    at = authority.rfind("@")
+    if at != -1:
+        return f"{scheme}***@{rest[at + 1:]}"
+    tail_at = rest.find("@", authority_end)
+    if tail_at != -1 and ":" in authority:
+        return f"{scheme}***@{rest[tail_at + 1:]}"
     return url
 
 

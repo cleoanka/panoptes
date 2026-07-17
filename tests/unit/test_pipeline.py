@@ -969,6 +969,34 @@ def test_stream_worker_scrubs_source_credentials_from_lifecycle_events(
     assert error.data["error"] == "open failed: rtsp://***@10.0.0.5:554/live"
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("rtsp://user:pass@cam.local:554/stream", "rtsp://***@cam.local:554/stream"),
+        # Unencoded '@' in the password: userinfo runs up to the LAST '@'.
+        ("rtsp://user:p@ss@cam.local:554/stream", "rtsp://***@cam.local:554/stream"),
+        # A '/' in the password (base64/random secrets carry one) must not fail
+        # OPEN: fail CLOSED and redact up to the credential '@' (CWE-532).
+        (
+            "rtsp://admin:Xy/9$kQ@10.0.0.5:554/Streaming/Channels/101",
+            "rtsp://***@10.0.0.5:554/Streaming/Channels/101",
+        ),
+        # A '@' in the path (not the authority) is left untouched.
+        ("https://api.local/v1@ref", "https://api.local/v1@ref"),
+        ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
+        ("not-a-url", "not-a-url"),
+    ],
+)
+def test_worker_scrub_url_mirrors_schemas(url: str, expected: str) -> None:
+    # The worker keeps a local copy of ``scrub_url`` (no api import chain); it
+    # must mask identically, including the fail-CLOSED '/'-in-password case.
+    from panoptes.api.schemas import scrub_url as canonical_scrub_url
+    from panoptes.pipeline.worker import scrub_url as worker_scrub_url
+
+    assert worker_scrub_url(url) == expected
+    assert worker_scrub_url(url) == canonical_scrub_url(url)
+
+
 def test_stream_worker_status_carries_processor_analytics_summary(
     tmp_path: Path,
 ) -> None:

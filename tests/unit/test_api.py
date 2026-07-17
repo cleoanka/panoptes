@@ -320,8 +320,19 @@ async def test_config_redacts_secrets(app_client) -> None:
         ("rtsp://user@cam.local/stream", "rtsp://***@cam.local/stream"),
         # A '@' living in the path (not the authority) is left untouched.
         ("https://key:tok@api.local/v1@ref", "https://***@api.local/v1@ref"),
+        # A '/' in the password (base64/random secrets carry one) must not make
+        # the mask fail OPEN: fail CLOSED and redact up to the credential '@'.
+        (
+            "rtsp://admin:Xy/9$kQ@10.0.0.5:554/Streaming/Channels/101",
+            "rtsp://***@10.0.0.5:554/Streaming/Channels/101",
+        ),
+        (
+            "postgresql+asyncpg://panoptes:p/w@db.internal:5432/panoptes",
+            "postgresql+asyncpg://***@db.internal:5432/panoptes",
+        ),
         # No credentials / not a URL: passed through unchanged.
         ("rtsp://cam.local/stream", "rtsp://cam.local/stream"),
+        ("https://api.local/v1@ref", "https://api.local/v1@ref"),
         ("not-a-url", "not-a-url"),
     ],
 )
@@ -329,7 +340,7 @@ def test_scrub_url_masks_userinfo(url: str, expected: str) -> None:
     scrubbed = scrub_url(url)
     assert scrubbed == expected
     # Whatever password bytes were present must be fully gone.
-    for secret in ("pass", "p@ss", "tok"):
+    for secret in ("pass", "p@ss", "tok", "Xy/9$kQ", "p/w"):
         if f":{secret}@" in url or f"//{secret}@" in url:
             assert secret not in scrubbed
 

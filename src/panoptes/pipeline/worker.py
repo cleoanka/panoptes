@@ -54,15 +54,30 @@ _STOP_JOIN_TIMEOUT_S = 10.0
 # so mask them before a source URL enters lifecycle-event data — those events
 # reach the live feeds, the DB and webhooks unredacted. Mirrors
 # ``panoptes.api.schemas.scrub_url`` (kept local to keep this module free of
-# the api/FastAPI import chain).
-_USERINFO_RE = re.compile(r"^(\w[\w+.-]*://)([^/]+)@([^@/]*.*)$")
+# the api/FastAPI import chain); the two copies must stay identical.
+_SCHEME_RE = re.compile(r"^(\w[\w+.-]*://)(.*)$", re.DOTALL)
 
 
 def scrub_url(url: str) -> str:
     """Mask ``user:password@`` credentials embedded in a URL."""
-    match = _USERINFO_RE.match(url)
-    if match:
-        return f"{match.group(1)}***@{match.group(3)}"
+    match = _SCHEME_RE.match(url)
+    if not match:
+        return url
+    scheme, rest = match.group(1), match.group(2)
+    # The authority ends at the first '/', '?' or '#'. When it holds an '@' the
+    # userinfo runs up to the LAST such '@', so an unencoded '@' in the password
+    # (``user:p@ss@host``) is masked whole. Otherwise a raw '/' in the password
+    # (RFC-3986-illegal but accepted by ffmpeg/asyncpg) has pushed the '@' past
+    # that delimiter: if the authority still shows a ':' credential marker and an
+    # '@' follows, we fail CLOSED and mask up to that first '@' rather than leak.
+    authority_end = min((i for i, c in enumerate(rest) if c in "/?#"), default=len(rest))
+    authority = rest[:authority_end]
+    at = authority.rfind("@")
+    if at != -1:
+        return f"{scheme}***@{rest[at + 1:]}"
+    tail_at = rest.find("@", authority_end)
+    if tail_at != -1 and ":" in authority:
+        return f"{scheme}***@{rest[tail_at + 1:]}"
     return url
 
 
