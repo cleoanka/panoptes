@@ -922,6 +922,21 @@ async def test_tracks_query_params_forwarded(app_client) -> None:
     assert row["plate_text"] == "34ABC123"
 
 
+async def test_tracks_null_attributes_serialized(app_client) -> None:
+    # A track whose ``attributes`` JSON column is NULL must still serialize:
+    # TrackRow.to_dict() coerces None->{} (mirroring EventRow.to_dict's
+    # ``data or {}``) so TrackOut's dict field validates instead of 500-ing.
+    from panoptes.storage.models import TrackRow
+
+    client, app = app_client
+    row = TrackRow(stream_id="cam1", track_id=7, attributes=None)
+    app.state.panoptes.db.tracks.rows = [row.to_dict()]
+    resp = await client.get("/api/v1/tracks", headers=AUTH)
+    assert resp.status_code == 200
+    (out,) = resp.json()
+    assert out["attributes"] == {}
+
+
 async def test_tracks_and_plates_forward_until_bound(app_client) -> None:
     # The upper time bound present on /events must exist on the sibling history
     # endpoints too; each forwards `until` to its repo query.
