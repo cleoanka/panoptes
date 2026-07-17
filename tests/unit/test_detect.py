@@ -412,6 +412,18 @@ class TestDecodeClassic:
         with pytest.raises(ValueError):
             decode_classic(np.zeros((84, 100)), conf=0.5, iou=0.5)
 
+    def test_caps_after_nms_to_max_det(self):
+        # Disjoint per-class boxes survive NMS untouched; the symmetric cap
+        # must still bound the returned count to max_det.
+        n = 400
+        out = np.zeros((1, 84, n), dtype=np.float32)
+        for column in range(n):
+            out[0, :4, column] = [15 * column, 15 * column, 10, 10]  # disjoint
+            out[0, 4 + (column % 80), column] = 0.5 + column / (2 * n)
+        (xyxy, scores, class_ids), = decode_classic(out, conf=0.25, iou=0.5)
+        assert len(xyxy) == 300
+        assert scores.min() >= 0.5 + (n - 300) / (2 * n)
+
 
 class TestParseE2E:
     def test_extracts_rows_above_conf(self):
@@ -430,6 +442,21 @@ class TestParseE2E:
     def test_rejects_wrong_last_dim(self):
         with pytest.raises(ValueError):
             parse_e2e(np.zeros((1, 300, 5)), conf=0.25)
+
+    def test_caps_oversized_output_to_max_det(self):
+        # A misconfigured/adversarial export can emit far more rows than the
+        # standard (B, 300, 6) contract; the cap must stop the flood and keep
+        # the highest-scoring detections.
+        n = 50_000
+        output = np.zeros((1, n, 6), dtype=np.float32)
+        output[0, :, :4] = [10, 20, 110, 120]
+        output[0, :, 4] = np.linspace(0.5, 0.9, n)  # ascending, all above conf
+        output[0, :, 5] = 2
+        (xyxy, scores, class_ids), = parse_e2e(output, conf=0.25)
+        assert len(xyxy) == 300
+        # Kept the top-300 by score (the tail of the ascending ramp).
+        threshold = np.float32(np.linspace(0.5, 0.9, n)[-300])
+        assert scores.min() >= threshold
 
 
 # ---------------------------------------------------------------------
