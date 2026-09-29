@@ -7,6 +7,7 @@ stream. All public methods are safe to call from ``asyncio.to_thread``.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 import time
@@ -222,6 +223,16 @@ class PipelineManager:
                     and processor.frames_seen % _PROGRESS_EVERY_N_FRAMES == 0
                 ):
                     progress_cb(min(0.99, processor.frames_seen / source.frame_count))
+        except Exception:
+            # finalize() on the error path too: force-finish in-flight tracks so
+            # their summaries are still emitted (otherwise lost), reset the
+            # active-tracks gauge to 0 and reap this job's (unbounded) label
+            # children — the same teardown the clean path runs in ``else`` — but
+            # guarded so a teardown failure can never mask the original error.
+            with contextlib.suppress(Exception):
+                processor.finalize(time.time())
+            raise
+        else:
             processor.finalize(time.time())
         finally:
             self._release_processor(processor)

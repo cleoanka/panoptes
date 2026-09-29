@@ -305,25 +305,29 @@ class StreamProcessor:
         self._remove_stream_metrics()
 
     def _remove_stream_metrics(self) -> None:
-        """Remove this stream's label children from the shared collectors.
+        """Remove an ephemeral stream's label children from the shared collectors.
+
+        Only EPHEMERAL (batch/ad-hoc, uuid-derived) stream ids are cleaned:
+        config-declared ids are the bounded, stable set whose cumulative
+        counters must survive stop/EOF/restart, so removing them would wipe
+        operator-facing dashboards on every restart. Config ids are recognised
+        via ``self._app_cfg.streams`` (the only bounded id set the processor
+        knows); an id absent from it is unbounded and must be reaped.
 
         Best-effort and guarded like every other metric touch (metrics must
-        never break the pipeline): resolves each collector by name, then removes
-        the label tuples whose ``stream`` label matches this stream — covering
-        the dynamic ``type``/``valid`` label combinations of the event and plate
-        counters that ``.labels()`` cannot enumerate ahead of time. Uses the
-        prometheus_client child map directly because it exposes no public
-        "remove every child for one label value" API.
+        never break the pipeline): ``remove_by_labels`` snapshots the child
+        keys under the collector's own ``_lock`` (``list(self._metrics)``), so a
+        concurrent stream inserting a first-of-type ``type``/``valid`` child
+        during teardown can never raise "dictionary changed size during
+        iteration" — it also partial-matches on the ``stream`` label alone,
+        covering the dynamic label combinations ``.labels()`` cannot enumerate.
         """
         stream_id = self._stream_cfg.id
+        if any(stream_id == cfg.id for cfg in self._app_cfg.streams):
+            return  # config-declared id: bounded, its counters must persist
         for collector in _stream_labelled_collectors():
-            labelnames = getattr(collector, "_labelnames", ())
-            stream_at = labelnames.index("stream")  # guaranteed by the resolver
-            for values in [
-                v for v in getattr(collector, "_metrics", {}) if v[stream_at] == stream_id
-            ]:
-                with contextlib.suppress(Exception):
-                    collector.remove(*values)
+            with contextlib.suppress(Exception):
+                collector.remove_by_labels({"stream": stream_id})
 
     def summary(self) -> dict[str, Any]:
         return self._analytics.summary()
@@ -470,6 +474,12 @@ class StreamWorker:
                         self._latest_jpeg = buf.tobytes()
                         self._last_jpeg_monotonic = now
         except Exception as exc:
+            # finalize() on the error path too: force-finish in-flight tracks so
+            # their summaries reach the DB (otherwise lost), reset the
+            # active-tracks gauge to 0 (otherwise pinned at its last value in
+            # every scrape until restart) and reap any ephemeral label children
+            # — the same teardown the clean EOF/stopped path runs below.
+            self._finalize_quietly()
             self._fail(str(exc))
             source.close()
             return
@@ -477,13 +487,25 @@ class StreamWorker:
             if self._stop.is_set():
                 reason = "stopped"
 
-        try:
-            self._processor.finalize(time.time())
-        except Exception as exc:
-            self._last_error = str(exc)
+        self._finalize_quietly()
         source.close()
         self._state = "stopped" if reason == "stopped" else "ended"
         self._publish_lifecycle(EventType.STREAM_ENDED, {"reason": reason})
+
+    def _finalize_quietly(self) -> None:
+        """Finalize the processor without letting a teardown failure re-raise.
+
+        Runs on every terminal path (clean EOF/stopped and mid-loop error), so
+        force-finish/metric-reset stays consistent across both; a second failure
+        inside finalize is latched into ``_last_error`` rather than propagated.
+        """
+        processor = self._processor
+        if processor is None:
+            return
+        try:
+            processor.finalize(time.time())
+        except Exception as exc:
+            self._last_error = str(exc)
 
     def _fail(self, message: str) -> None:
         message = self._scrub_error(message)

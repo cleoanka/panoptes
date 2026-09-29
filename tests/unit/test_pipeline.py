@@ -8,6 +8,7 @@ runtime is ever imported.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 import sys
@@ -53,7 +54,11 @@ from panoptes.pipeline.governor import FrameGovernor
 from panoptes.pipeline.scheduler import _SENTINEL, InferenceScheduler
 from panoptes.pipeline.snapshots import SnapshotSaver
 from panoptes.pipeline.source import OpenCvSource, PyAvSource, open_source
-from panoptes.pipeline.worker import StreamWorker, _stream_labelled_collectors
+from panoptes.pipeline.worker import (
+    StreamProcessor,
+    StreamWorker,
+    _stream_labelled_collectors,
+)
 
 # ---------------------------------------------------------------------
 # helpers / fakes
@@ -924,6 +929,134 @@ def test_process_video_removes_stream_metric_labels_on_teardown(
     assert job_id.encode() not in metrics.render_metrics()[0]
     # a config-declared stream's children are left intact
     assert _stream_metric_children(survivor) == 1
+
+
+def _active_tracks_value(stream_id: str) -> float | None:
+    """The live ``panoptes_active_tracks{stream=stream_id}`` gauge value, or
+    ``None`` when no such child exists — read WITHOUT ``.labels()``, which would
+    re-create a removed child."""
+    stream_at = metrics.ACTIVE_TRACKS._labelnames.index("stream")
+    for key, child in metrics.ACTIVE_TRACKS._metrics.items():
+        if key[stream_at] == stream_id:
+            return child._value.get()
+    return None
+
+
+def test_remove_stream_metrics_survives_concurrent_child_insert():
+    """_remove_stream_metrics must not raise while another stream inserts a
+    first-of-type label child on the same shared collector.
+
+    The children live in a shared module-level collector dict that
+    prometheus_client mutates under its own ``_lock`` on the first occurrence
+    of a (type, stream) combo. Iterating that dict unlocked during teardown
+    raced 'dictionary changed size during iteration' and — on the batch
+    try/finally path — failed the whole job. remove_by_labels snapshots the
+    keys under the lock, so the reap can never break the pipeline.
+    """
+    config = AppConfig(streams=[], server=ServerConfig(media_dir="unused"))
+    # A batch-style (ephemeral, non-config) id so the reap actually runs.
+    processor = types.SimpleNamespace(_stream_cfg=StreamConfig(id="job-race", source="x"), _app_cfg=config)
+
+    stop = threading.Event()
+    error: list[BaseException] = []
+
+    def churn() -> None:
+        # A concurrent live stream emitting a new event *type* every iteration
+        # inserts a brand-new child into EVENTS_TOTAL._metrics under its lock.
+        i = 0
+        while not stop.is_set():
+            metrics.EVENTS_TOTAL.labels(type=f"race-{i}", stream="other").inc()
+            i += 1
+
+    churner = threading.Thread(target=churn)
+    churner.start()
+    try:
+        for _ in range(2000):
+            try:
+                StreamProcessor._remove_stream_metrics(processor)  # type: ignore[arg-type]
+            except BaseException as exc:  # the whole point is that nothing escapes
+                error.append(exc)
+                break
+    finally:
+        stop.set()
+        churner.join(5.0)
+
+    assert not error, f"reap raised under concurrent insert: {error}"
+    # cleanup: drop the churned 'other' children so the shared registry stays tidy
+    for collector in _stream_labelled_collectors():
+        with contextlib.suppress(Exception):
+            collector.remove_by_labels({"stream": "other"})
+
+
+def test_config_stream_metric_counters_survive_restart(tmp_path: Path, fake_components):
+    """A config-declared stream's cumulative counters must persist across a
+    stop/EOF/restart — only ephemeral batch ids get reaped.
+
+    The round-10 reap keyed purely on stream id, so every live worker's
+    finalize() wiped its config stream's counters on normal EOF. Here a real
+    config-stream worker runs to EOF and its frames_processed child must
+    survive (and the active-tracks gauge is reset to 0, not removed).
+    """
+    video = write_video(tmp_path / "input.mp4")
+    stream = StreamConfig(id="cam-restart", source=str(video), governor=GovernorConfig(enabled=False))
+    config = AppConfig(
+        streams=[stream], server=ServerConfig(media_dir=str(tmp_path / "media"))
+    )
+    before = set(threading.enumerate())
+    manager = PipelineManager(config, EventBus())
+    try:
+        manager.start()
+        wait_for(
+            lambda: manager.status()["cam-restart"]["state"] == "ended",
+            timeout=20.0,
+            message="STREAM_ENDED",
+        )
+    finally:
+        manager.stop()
+
+    # config-declared id: its cumulative children survive finalize() untouched
+    assert _stream_metric_children("cam-restart") > 0
+    assert b"cam-restart" in metrics.render_metrics()[0]
+    assert metrics.FRAMES_PROCESSED.labels(stream="cam-restart")._value.get() == 60
+    # the active-tracks gauge is reset (finalize ran) but the child persists
+    assert _active_tracks_value("cam-restart") == 0.0
+    _assert_no_leaked_threads(before)
+
+
+def test_process_video_error_path_cleans_labels_and_resets_gauge(
+    tmp_path: Path, fake_components, monkeypatch: pytest.MonkeyPatch
+):
+    """A batch job that raises mid-loop must still reap its (unbounded) label
+    children and reset its active-tracks gauge — finalize() runs on the error
+    path too, so a failed upload leaks no metric series."""
+    video = write_video(tmp_path / "input.mp4")
+    config = AppConfig(streams=[], server=ServerConfig(media_dir=str(tmp_path / "media")))
+    manager = PipelineManager(config, EventBus())
+
+    job_id = "job-errorpath"
+    # Raise from inside process() after a couple of frames, so per-stream
+    # children (frames/active-tracks) already exist when the loop dies.
+    real_process = StreamProcessor.process
+    calls = {"n": 0}
+
+    def boom(self, packet, want_annotated=False):
+        calls["n"] += 1
+        if calls["n"] >= 3:
+            raise RuntimeError("detector batch failure")
+        return real_process(self, packet, want_annotated)
+
+    monkeypatch.setattr(StreamProcessor, "process", boom)
+
+    try:
+        with pytest.raises(RuntimeError, match="detector batch failure"):
+            manager.process_video(video, StreamConfig(id=job_id, source=str(video)))
+    finally:
+        manager.stop()
+
+    # error path finalized: no leaked children, and the gauge child is gone
+    assert _stream_metric_children(job_id) == 0
+    assert job_id.encode() not in metrics.render_metrics()[0]
+    assert _active_tracks_value(job_id) is None
 
 
 def test_release_processor_failure_logs_the_exception(
