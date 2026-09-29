@@ -52,14 +52,21 @@ class ZoneMonitor:
         for track in tracks:
             if track.state not in _MONITORED_STATES:
                 continue
-            if self.config.classes is not None and track.vehicle_class not in self.config.classes:
+            states: dict[str, dict[str, Any]] = track.data.setdefault(ZONE_STATE_KEY, {})
+            state = states.get(self.config.id)
+            allowed = (
+                self.config.classes is None or track.vehicle_class in self.config.classes
+            )
+            # A track whose class votes out of the filter while inside must
+            # exit symmetrically: keep the class check for entry, but let an
+            # already-inside track fall through to the exit branch so the
+            # occupancy count and persisted state never drift.
+            if not allowed and state is None:
                 continue
             anchor = track.anchor
             if anchor is None:
                 continue
-            states: dict[str, dict[str, Any]] = track.data.setdefault(ZONE_STATE_KEY, {})
-            state = states.get(self.config.id)
-            inside = self.polygon.contains(*anchor)
+            inside = allowed and self.polygon.contains(*anchor)
 
             if inside and state is None:
                 states[self.config.id] = {"entered_ts": timestamp, "dwell_emitted": False}

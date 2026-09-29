@@ -18,7 +18,9 @@ and the modules can be substituted in tests.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -48,6 +50,112 @@ logger = logging.getLogger(__name__)
 _JPEG_REFRESH_MIN_INTERVAL_S = 0.1  # latest_jpeg refreshed at most 10/s
 _FPS_WINDOW_S = 2.0                 # rolling FPS horizon for status()
 _STOP_JOIN_TIMEOUT_S = 10.0
+
+# Every prometheus metric carrying a per-stream ``stream`` label. Batch jobs
+# get an effectively-unbounded uuid-derived id, so their label children must
+# be removed when the job finishes or the registry (and every /metrics scrape)
+# grows without bound. prometheus_client never GCs children on its own.
+_STREAM_LABELLED_METRICS = (
+    "panoptes_frames_processed_total",
+    "panoptes_frames_dropped_total",
+    "panoptes_active_tracks",
+    "panoptes_events_total",
+    "panoptes_plate_reads_total",
+    "panoptes_stream_fps",
+)
+
+
+def _stream_labelled_collectors() -> list[Any]:
+    """Prometheus collectors from :data:`_STREAM_LABELLED_METRICS` that exist
+    and carry a ``stream`` label (empty when observability is absent).
+
+    Resolves against ``panoptes.observability.metrics`` the same defensive way
+    as :func:`~panoptes.pipeline.scheduler.metric_handle` — matching on the
+    collector's ``_name`` (the python client strips a trailing ``_total``) —
+    because a metric child can only be removed through its parent collector,
+    which the ``_MetricHandle`` facade does not expose.
+    """
+    try:
+        from panoptes.observability import metrics
+    except Exception:
+        return []
+    wanted = {n: n.removesuffix("_total") for n in _STREAM_LABELLED_METRICS}
+    names = set(wanted) | set(wanted.values())
+    collectors: list[Any] = []
+    try:
+        for obj in vars(metrics).values():
+            name = getattr(obj, "_name", None)
+            if (
+                isinstance(name, str)
+                and name in names
+                and "stream" in getattr(obj, "_labelnames", ())
+            ):
+                collectors.append(obj)
+    except Exception:
+        return []
+    return collectors
+
+# RTSP/HTTP camera sources routinely embed credentials (rtsp://user:pass@host),
+# so mask them before a source URL enters lifecycle-event data — those events
+# reach the live feeds, the DB and webhooks unredacted. Mirrors
+# ``panoptes.api.schemas.scrub_url`` (kept local to keep this module free of
+# the api/FastAPI import chain); the two copies must stay identical.
+_SCHEME_RE = re.compile(r"^(\w[\w+.-]*://)(.*)$", re.DOTALL)
+# A bare ``host:port`` authority — the ':' is a port, NOT a credential marker.
+# A bracketed IPv6 literal (``[::1]``, ``[2001:db8::1]:554``) is a host too, so
+# its inner ':' must not read as a credential separator either (with or without
+# a trailing port).
+_HOST_PORT_RE = re.compile(r"^(?:\[[0-9A-Fa-f:]+\](?::\d+)?|[^:@/?#]+:\d+)$")
+# Some driver URLs carry the secret as a query parameter (``?password=...``)
+# instead of userinfo; mask known credential keys, the value running up to the
+# next '&' or the fragment '#'. The leading ``[?&]`` anchors on a real key start
+# so a substring like ``app_password=`` is not matched.
+_QUERY_SECRET_RE = re.compile(
+    r"([?&](?:password|passwd|pwd|secret|token)=)[^&#]*", re.IGNORECASE
+)
+
+
+def scrub_url(url: str) -> str:
+    """Mask ``user:password@`` credentials and ``?password=`` query secrets."""
+    match = _SCHEME_RE.match(url)
+    if not match:
+        return url
+    scheme, rest = match.group(1), match.group(2)
+    # The authority ends at the first '/', '?' or '#'. When it holds an '@' the
+    # userinfo runs up to the LAST such '@', so an unencoded '@' in the password
+    # (``user:p@ss@host``) is masked whole. Otherwise a raw '/' in the password
+    # (RFC-3986-illegal but accepted by ffmpeg/asyncpg) has pushed the '@' past
+    # that delimiter, so a tail '@' is the true userinfo terminator. A '@'
+    # sitting purely in the query/fragment is handled last by the query masker.
+    authority_end = min((i for i, c in enumerate(rest) if c in "/?#"), default=len(rest))
+    authority = rest[:authority_end]
+    at = authority.rfind("@")
+    if at != -1:
+        return _mask_query_secrets(f"{scheme}***@{rest[at + 1:]}")
+    tail_at = rest.find("@", authority_end)
+    if tail_at != -1:
+        # Fail CLOSED on a tail '@' only when the text before it is genuine
+        # userinfo, not ``host[:port]/path`` whose path merely contains an '@'.
+        # A '@' behind a '?'/'#' is in the query/fragment, never the userinfo;
+        # otherwise a credential ':' is one that survives after stripping a bare
+        # ``host:port`` prefix (so ``cam.local:554/x@`` passes through while
+        # ``user:p/w@`` masks). Residual (accepted, documented): a colon-less
+        # '/'-bearing username (``us/er@host``, no password) and a purely-digit
+        # pre-'/' password fragment (``user:12/pw@``, indistinguishable from a
+        # ``host:port`` authority) still pass through — masking either would
+        # over-mask the ubiquitous credential-free ``host:port/path@`` shape.
+        userinfo = rest[:tail_at]
+        if "?" not in userinfo and "#" not in userinfo:
+            first_slash = userinfo.index("/")  # tail_at > authority_end ⇒ a '/' exists
+            before, after = userinfo[:first_slash], userinfo[first_slash + 1 :]
+            if ":" in after or (":" in before and not _HOST_PORT_RE.match(before)):
+                return _mask_query_secrets(f"{scheme}***@{rest[tail_at + 1:]}")
+    return _mask_query_secrets(url)
+
+
+def _mask_query_secrets(url: str) -> str:
+    """Redact the value of any ``?password=``/``&token=`` credential query key."""
+    return _QUERY_SECRET_RE.sub(r"\1***", url)
 
 
 @dataclass(slots=True)
@@ -190,6 +298,36 @@ class StreamProcessor:
             self._emit(generated, None, tracks)
         self.live_tracks = []
         self._m_active.set(0.0)
+        # Last metric touch for this stream: drop its label children so a
+        # long-lived server processing many (uuid-keyed) batch jobs does not
+        # leak metric series. Must run *after* every set()/inc() above, which
+        # would otherwise re-create the child it just removed.
+        self._remove_stream_metrics()
+
+    def _remove_stream_metrics(self) -> None:
+        """Remove an ephemeral stream's label children from the shared collectors.
+
+        Only EPHEMERAL (batch/ad-hoc, uuid-derived) stream ids are cleaned:
+        config-declared ids are the bounded, stable set whose cumulative
+        counters must survive stop/EOF/restart, so removing them would wipe
+        operator-facing dashboards on every restart. Config ids are recognised
+        via ``self._app_cfg.streams`` (the only bounded id set the processor
+        knows); an id absent from it is unbounded and must be reaped.
+
+        Best-effort and guarded like every other metric touch (metrics must
+        never break the pipeline): ``remove_by_labels`` snapshots the child
+        keys under the collector's own ``_lock`` (``list(self._metrics)``), so a
+        concurrent stream inserting a first-of-type ``type``/``valid`` child
+        during teardown can never raise "dictionary changed size during
+        iteration" — it also partial-matches on the ``stream`` label alone,
+        covering the dynamic label combinations ``.labels()`` cannot enumerate.
+        """
+        stream_id = self._stream_cfg.id
+        if any(stream_id == cfg.id for cfg in self._app_cfg.streams):
+            return  # config-declared id: bounded, its counters must persist
+        for collector in _stream_labelled_collectors():
+            with contextlib.suppress(Exception):
+                collector.remove_by_labels({"stream": stream_id})
 
     def summary(self) -> dict[str, Any]:
         return self._analytics.summary()
@@ -212,7 +350,7 @@ class StreamProcessor:
             if event.type is EventType.PLATE_READ:
                 metric_handle("panoptes_plate_reads_total").labels(
                     stream=event.stream_id,
-                    valid=str(bool(event.data.get("valid", True))).lower(),
+                    valid=str(bool(event.data.get("valid", False))).lower(),
                 ).inc()
             self._bus.publish(event)
 
@@ -294,6 +432,9 @@ class StreamWorker:
             "frames": proc.frames_processed if proc else 0,
             "dropped": proc.frames_dropped if proc else 0,
             "active_tracks": proc.active_track_count if proc else 0,
+            # AnalyticsEngine line/zone counters; the /analytics endpoint and
+            # the annotate() overlay read this key off PipelineManager.status().
+            "analytics": proc.summary() if proc else {},
             "last_error": self._last_error,
         }
 
@@ -311,7 +452,9 @@ class StreamWorker:
             return
 
         self._state = "running"
-        self._publish_lifecycle(EventType.STREAM_STARTED, {"source": self._stream_cfg.source})
+        self._publish_lifecycle(
+            EventType.STREAM_STARTED, {"source": scrub_url(self._stream_cfg.source)}
+        )
         reason = "eof"
         try:
             for packet in source:
@@ -331,6 +474,12 @@ class StreamWorker:
                         self._latest_jpeg = buf.tobytes()
                         self._last_jpeg_monotonic = now
         except Exception as exc:
+            # finalize() on the error path too: force-finish in-flight tracks so
+            # their summaries reach the DB (otherwise lost), reset the
+            # active-tracks gauge to 0 (otherwise pinned at its last value in
+            # every scrape until restart) and reap any ephemeral label children
+            # — the same teardown the clean EOF/stopped path runs below.
+            self._finalize_quietly()
             self._fail(str(exc))
             source.close()
             return
@@ -338,24 +487,51 @@ class StreamWorker:
             if self._stop.is_set():
                 reason = "stopped"
 
-        try:
-            self._processor.finalize(time.time())
-        except Exception as exc:
-            self._last_error = str(exc)
+        self._finalize_quietly()
         source.close()
         self._state = "stopped" if reason == "stopped" else "ended"
         self._publish_lifecycle(EventType.STREAM_ENDED, {"reason": reason})
 
+    def _finalize_quietly(self) -> None:
+        """Finalize the processor without letting a teardown failure re-raise.
+
+        Runs on every terminal path (clean EOF/stopped and mid-loop error), so
+        force-finish/metric-reset stays consistent across both; a second failure
+        inside finalize is latched into ``_last_error`` rather than propagated.
+        """
+        processor = self._processor
+        if processor is None:
+            return
+        try:
+            processor.finalize(time.time())
+        except Exception as exc:
+            self._last_error = str(exc)
+
     def _fail(self, message: str) -> None:
+        message = self._scrub_error(message)
         self._last_error = message
         self._state = "error"
+        # A crashed worker (source open, decode, inference, ALPR/attributes)
+        # is otherwise invisible in server logs. Log the credential-scrubbed
+        # message only — live exc_info would render an unscrubbed traceback
+        # carrying the raw ``user:pass@`` source URL (CWE-532).
+        logger.error("stream '%s' failed: %s", self._stream_cfg.id, message)
         self._publish_lifecycle(EventType.STREAM_ERROR, {"error": message})
 
     def _on_source_error(self, message: str) -> None:
         # Called from the worker thread inside the source's reconnect loop;
         # backoff (1s -> 30s) naturally rate-limits these events.
+        message = self._scrub_error(message)
         self._last_error = message
         self._publish_lifecycle(EventType.STREAM_ERROR, {"error": message, "reconnecting": True})
+
+    def _scrub_error(self, message: str) -> str:
+        # source.py error messages embed the raw source URL mid-string
+        # (e.g. "open failed: rtsp://user:pass@host"); ``scrub_url`` is anchored
+        # so replace the known credentialed source with its masked form instead.
+        source = self._stream_cfg.source
+        scrubbed = scrub_url(source)
+        return message.replace(source, scrubbed) if scrubbed != source else message
 
     def _publish_lifecycle(self, event_type: EventType, data: dict[str, Any]) -> None:
         proc = self._processor

@@ -64,6 +64,13 @@ class RFDetrDetector(Detector):
         # verbatim to the constructor (e.g. {"pretrain_weights": "path.pth"});
         # see training/EGITIM.md section 8.
         ctor_kwargs = dict(self.config.extra.get("rfdetr_kwargs", {}))
+        # "auto" lets rfdetr pick the device; an explicit device in
+        # rfdetr_kwargs always wins over config.device.
+        if self.config.device != "auto":
+            ctor_kwargs.setdefault("device", self.config.device)
+        # NOTE: config.half (FP16) has no RF-DETR constructor equivalent —
+        # precision is controlled via .optimize_for_inference() at runtime,
+        # not construction — so it is deliberately not wired here.
         self._model = model_cls(**ctor_kwargs)
 
     def infer(self, frames: list[np.ndarray]) -> list[list[Detection]]:

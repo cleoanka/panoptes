@@ -2,9 +2,12 @@
 
 A single YAML file (``panoptes.yaml``) declares detectors, streams,
 calibration, analytics geometry (lines/zones), watchlists and the
-declarative rules DSL. Every field can be overridden via environment
-variables with the ``PANOPTES_`` prefix and ``__`` as nesting delimiter
-(e.g. ``PANOPTES_SERVER__PORT=9000``).
+declarative rules DSL. Any field *absent* from the YAML can be supplied via
+environment variables with the ``PANOPTES_`` prefix and ``__`` as nesting
+delimiter (e.g. ``PANOPTES_SERVER__PORT=9000``). Note the precedence:
+:func:`load_config` passes the YAML as init kwargs, which outrank env vars,
+so a field already set in YAML **silently shadows** its env override rather
+than being overridden by it.
 
 Design rules:
 
@@ -25,6 +28,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from panoptes.core.errors import ConfigError
+from panoptes.core.events import EventType
 from panoptes.core.types import VehicleClass
 
 __all__ = [
@@ -44,6 +48,7 @@ __all__ = [
     "ServerConfig",
     "SnapshotConfig",
     "SpeedConfig",
+    "StoppedVehicleConfig",
     "StreamConfig",
     "TrackerConfig",
     "WatchlistConfig",
@@ -63,12 +68,15 @@ class DetectorConfig(BaseModel):
     backend: Literal["ultralytics", "rfdetr", "onnx", "tensorrt", "mock"] = "ultralytics"
     model: str = "yolo26s.pt"
     device: str = "auto"  # auto | cpu | cuda:0 | mps
-    imgsz: int = 640
+    # Letterbox canvas edge in pixels; must be positive or the synthetic
+    # frame allocation (imgsz*imgsz) and every backend's resize crash deep
+    # in numpy instead of failing cleanly here.
+    imgsz: int = Field(default=640, gt=0)
     conf: float = 0.25
     iou: float = 0.5  # ignored by end-to-end (NMS-free) models such as YOLO26
-    half: bool = True
+    half: bool = True  # FP16 hint; onnx/tensorrt bake precision into the artifact at export
     classes: list[VehicleClass] | None = None  # canonical class filter; None = all vehicles
-    max_batch: int = 8
+    max_batch: int = Field(default=8, ge=1)  # frames per infer() call; < 1 is meaningless
     extra: dict[str, Any] = Field(default_factory=dict)  # backend-specific knobs
 
 
@@ -103,12 +111,28 @@ class CalibrationConfig(BaseModel):
         return self
 
 
+class StoppedVehicleConfig(BaseModel):
+    """Detects a vehicle that stays (nearly) stationary for a dwell.
+
+    Rides on the same calibrated speed estimate as SPEEDING: a track whose
+    smoothed speed stays ``<= max_speed_kmh`` continuously for at least
+    ``min_stopped_s`` emits one STOPPED_VEHICLE event."""
+
+    enabled: bool = False
+    max_speed_kmh: float = Field(default=3.0, ge=0.0)   # at or below this counts as 'stopped'
+    min_stopped_s: float = Field(default=10.0, ge=0.0)  # dwell before alerting
+
+
 class SpeedConfig(BaseModel):
     enabled: bool = True
-    window_s: float = 1.0        # sliding window for velocity estimation
-    min_track_s: float = 0.7     # don't report speed for younger tracks
-    ema_alpha: float = 0.35      # exponential smoothing of the km/h value
+    window_s: float = Field(default=1.0, gt=0.0)     # sliding window for velocity estimation
+    min_track_s: float = Field(default=0.7, ge=0.0)  # don't report speed for younger tracks
+    # EMA smoothing of the km/h value; the recurrence is only contractive
+    # (stable) for alpha in (0, 1], so bound it there — an out-of-range
+    # alpha diverges and corrupts SPEEDING/STOPPED decisions.
+    ema_alpha: float = Field(default=0.35, gt=0.0, le=1.0)
     limit_kmh: float | None = None  # emits SPEEDING events when exceeded
+    stopped: StoppedVehicleConfig = Field(default_factory=StoppedVehicleConfig)
 
 
 class AlprConfig(BaseModel):
@@ -159,6 +183,9 @@ class LineConfig(BaseModel):
     classes: list[VehicleClass] | None = None
     forward_label: str = "forward"
     backward_label: str = "backward"
+    # When set, a crossing whose canonical direction differs also emits a
+    # WRONG_WAY primitive (None disables — the line is bidirectional).
+    allowed_direction: Literal["forward", "backward"] | None = None
 
     @field_validator("points")
     @classmethod
@@ -312,10 +339,28 @@ class GovernorConfig(BaseModel):
 class SnapshotConfig(BaseModel):
     enabled: bool = True
     on_events: list[str] = Field(
-        default_factory=lambda: ["watchlist_hit", "speeding", "wrong_way", "rule_triggered"]
+        default_factory=lambda: [
+            "watchlist_hit",
+            "speeding",
+            "wrong_way",
+            "stopped_vehicle",
+            "rule_triggered",
+        ]
     )
     annotate: bool = True
     max_per_minute: int = 60
+
+    @field_validator("on_events")
+    @classmethod
+    def _known_events(cls, v: list[str]) -> list[str]:
+        # Snapshots match on ``event.type.value``; a typo here silently
+        # disables capture for that event, so fail fast at startup.
+        allowed = {e.value for e in EventType}
+        for name in v:
+            if name not in allowed:
+                expected = ", ".join(sorted(allowed))
+                raise ValueError(f"unknown snapshot event '{name}'; expected one of: {expected}")
+        return v
 
 
 class StreamConfig(BaseModel):
@@ -441,12 +486,21 @@ class AppConfig(BaseSettings):
                 if t not in stream_ids:
                     raise ConfigError(f"rule '{rule.id}' references unknown stream '{t}'")
             ref = getattr(cond, "line", None) or getattr(cond, "zone", None)
-            if ref is not None and rule.streams is not None:
-                for t in rule.streams:
-                    if ref not in geometry.get(t, set()):
-                        raise ConfigError(
-                            f"rule '{rule.id}': stream '{t}' has no line/zone '{ref}'"
-                        )
+            if ref is not None:
+                if rule.streams is not None:
+                    for t in rule.streams:
+                        if ref not in geometry.get(t, set()):
+                            raise ConfigError(
+                                f"rule '{rule.id}': stream '{t}' has no line/zone '{ref}'"
+                            )
+                # Unscoped (``streams: null``) rules run on every stream that
+                # carries the referenced geometry; a ref that exists nowhere
+                # can never fire, so treat it as a configuration error rather
+                # than a silent no-op (mirrors the watchlist check below).
+                elif ref not in set().union(*geometry.values()):
+                    raise ConfigError(
+                        f"rule '{rule.id}' references unknown line/zone '{ref}'"
+                    )
             wl = getattr(cond, "watchlist", None)
             if wl is not None and wl not in watchlist_ids:
                 raise ConfigError(f"rule '{rule.id}' references unknown watchlist '{wl}'")

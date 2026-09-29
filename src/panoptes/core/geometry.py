@@ -146,10 +146,11 @@ class LineSegment:
         """Return +1 / -1 for a crossing (sign = direction), 0 for none.
 
         +1 means movement from the negative half-plane to the positive one.
-        Half-open convention: a point exactly ON the line (side == 0)
-        belongs to the half-plane it is *leaving from*, so a trajectory
-        that touches the line for one frame (neg -> 0 -> pos) counts
-        exactly once, never twice.
+        Half-open convention: a point exactly ON the line (``side == 0``)
+        is grouped with the *positive* half-plane, so a trajectory that
+        touches the line for one frame (neg -> 0 -> pos) is counted on the
+        ``neg -> 0`` step and never again on ``0 -> pos`` — exactly once,
+        never twice.
         """
         s1 = self.side(*p1)
         s2 = self.side(*p2)
@@ -278,7 +279,20 @@ class Homography:
         h = np.linalg.inv(t_dst) @ h_norm @ t_src
         if abs(h[2, 2]) < 1e-12:
             raise ValueError("Degenerate homography (collinear points?)")
-        return cls(h / h[2, 2])
+        h = h / h[2, 2]
+        # Collinear points trip the guard above, but coincident (or otherwise
+        # rank-deficient) correspondences yield a finite h[2, 2] and slip past
+        # it, leaving a singular matrix that later crashes .inverse with a
+        # LinAlgError or silently collapses the whole image onto a line. A
+        # scale-invariant conditioning check (smallest / largest singular
+        # value) rejects them here so callers get one clean ValueError. The
+        # threshold sits in the wide gap between genuinely singular matrices
+        # (reciprocal condition ~1e-34) and valid but ill-conditioned ones
+        # (~1e-15 even under extreme image/ground scale mismatch).
+        singular_values = np.linalg.svd(h, compute_uv=False)
+        if not np.isfinite(h).all() or singular_values[-1] < 1e-20 * singular_values[0]:
+            raise ValueError("Degenerate homography (coincident/collinear points?)")
+        return cls(h)
 
     def project(self, points: np.ndarray | Sequence[Sequence[float]]) -> np.ndarray:
         """Project ``(N, 2)`` image points to ground coordinates."""

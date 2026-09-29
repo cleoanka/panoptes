@@ -9,6 +9,9 @@ published after the client sees the connection open can be missed.
 from __future__ import annotations
 
 import asyncio
+import json
+import math
+from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
@@ -23,6 +26,28 @@ router = APIRouter()
 # Application-defined close codes (4000-4999 range per RFC 6455).
 _CLOSE_UNAUTHORIZED = 4401
 _CLOSE_NOT_READY = 4503
+
+
+def _strict_json(payload: dict[str, Any]) -> str:
+    # Mirror the SSE feed's serializer (routes/events.py): Starlette's
+    # WebSocket.send_json uses the default allow_nan=True, which emits
+    # NaN/Infinity -- invalid JSON that breaks strict clients. A non-finite
+    # float can reach the live feed via event.data (e.g. an early speed
+    # estimate), so coerce those to null rather than emit non-standard tokens.
+    try:
+        return json.dumps(payload, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(payload), allow_nan=False)
+
+
+def _finite(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_finite(v) for v in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
 
 
 @router.websocket("/events/ws")
@@ -72,7 +97,11 @@ async def events_ws(
                 try:
                     # In hashed plate-storage mode the live feed must match
                     # the at-rest representation: plate text goes out hashed.
-                    await websocket.send_json(redact_event_dict(event.to_dict(), state))
+                    # send_text (not send_json) so _strict_json can coerce any
+                    # non-finite float to null instead of emitting NaN/Infinity.
+                    await websocket.send_text(
+                        _strict_json(redact_event_dict(event.to_dict(), state))
+                    )
                 except (WebSocketDisconnect, RuntimeError):
                     break
     finally:

@@ -36,6 +36,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
 
 import panoptes
+from panoptes.analytics.rules.actions import ActionDispatcher
 from panoptes.api.auth import key_is_valid
 from panoptes.api.jobs import JobRegistry
 from panoptes.api.routes import router as api_router
@@ -177,7 +178,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         state.started_wall = time.time()
         yield
     finally:
-        # Reverse order: retention -> pipeline -> database.
+        # Reverse order: retention -> pipeline -> action dispatcher -> database.
         if state.retention_task is not None:
             state.retention_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -190,6 +191,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 await asyncio.to_thread(state.manager.stop)
             except Exception:
                 logger.exception("pipeline stop failed during shutdown")
+        # Drain the process-wide action dispatcher: the rules engine starts it
+        # lazily via ActionDispatcher.shared(), so its daemon worker (and any
+        # queued webhook/log deliveries) must be flushed + joined here rather
+        # than dying with the interpreter. Off-loop: close() joins the thread.
+        await asyncio.to_thread(ActionDispatcher.close_shared)
         await db.disconnect()
         state.manager = None
         state.db = None

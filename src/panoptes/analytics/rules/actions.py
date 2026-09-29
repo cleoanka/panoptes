@@ -47,6 +47,21 @@ class ActionDispatcher:
                 cls._shared = cls()
             return cls._shared
 
+    @classmethod
+    def close_shared(cls) -> None:
+        """Drain and stop the process-wide singleton, if one was started.
+
+        The shutdown hook (API lifespan / ``PipelineManager.stop``) calls
+        this so queued webhook/log actions are flushed and the worker
+        thread joined instead of dying with the interpreter. Idempotent:
+        a fresh singleton is lazily recreated by :meth:`shared` on any
+        later use.
+        """
+        with cls._shared_guard:
+            dispatcher = cls._shared
+        if dispatcher is not None:
+            dispatcher.close()
+
     def __init__(self, max_queue: int = 1024) -> None:
         self._queue: queue.Queue[tuple[Event, WebhookAction | LogAction] | None] = queue.Queue(
             maxsize=max_queue

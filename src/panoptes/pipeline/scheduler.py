@@ -14,6 +14,7 @@ block on ``put`` — natural backpressure instead of unbounded memory.
 from __future__ import annotations
 
 import contextlib
+import logging
 import queue
 import threading
 import time
@@ -29,7 +30,16 @@ if TYPE_CHECKING:
 
 __all__ = ["InferenceScheduler", "metric_handle"]
 
+logger = logging.getLogger(__name__)
+
 _SENTINEL = object()
+
+# Upper bound on how long close() waits for a wedged detector (stuck in
+# infer()) before giving up the join and leaving teardown to the daemon
+# thread. Everything else on the close() path is non-blocking, so this is
+# the true worst-case duration of close(). Exposed as a parameter (like
+# worker.stop()) so callers/tests can tighten it.
+_CLOSE_JOIN_TIMEOUT_S = 30.0
 
 
 class _MetricHandle:
@@ -105,6 +115,11 @@ class InferenceScheduler:
         self._queue: queue.Queue = queue.Queue(maxsize=max(4 * max_batch, 16))
         self._closed = False
         self._close_lock = threading.Lock()
+        # Lock-free shutdown flag: set *before* close() contends for _close_lock
+        # and checked by both the scheduler thread and a blocked submit(), so a
+        # wedged detector (thread stuck in infer(), queue full) can never keep
+        # close() from returning within its join timeout.
+        self._shutdown = threading.Event()
         self._batch_seconds = metric_handle("panoptes_inference_seconds")
         self._batch_size = metric_handle("panoptes_inference_batch_size")
         self._thread = threading.Thread(
@@ -115,40 +130,85 @@ class InferenceScheduler:
     # -- worker-facing API ---------------------------------------------
     def submit(self, frame: np.ndarray) -> Future[list[Detection]]:
         """Enqueue one frame; the future resolves to its detections."""
-        if self._closed:
-            raise RuntimeError("InferenceScheduler is closed")
         future: Future[list[Detection]] = Future()
-        self._queue.put((frame, future))
+        # Hold _close_lock across the closed-check + enqueue so a submission
+        # cannot slip onto the queue after close() has already drained it
+        # (which would orphan the future and hang the worker forever).
+        with self._close_lock:
+            if self._closed:
+                raise RuntimeError("InferenceScheduler is closed")
+            # Never block *indefinitely* on a full queue while holding the lock:
+            # a wedged detector stops the scheduler thread draining, so an
+            # unbounded put would deadlock close() (which needs this lock) —
+            # exactly the case round-8's 30s join was meant to bound. Instead
+            # wait in short slices, re-checking _shutdown so close() (which sets
+            # it before contending for the lock) unblocks us into a clean reject.
+            while True:
+                if self._shutdown.is_set():
+                    raise RuntimeError("InferenceScheduler is closed")
+                try:
+                    self._queue.put((frame, future), timeout=0.05)
+                    break
+                except queue.Full:
+                    continue
         return future
 
     def infer(self, frame: np.ndarray) -> list[Detection]:
         """Blocking convenience for workers; propagates detector errors."""
         return self.submit(frame).result()
 
-    def close(self) -> None:
+    def close(self, timeout: float = _CLOSE_JOIN_TIMEOUT_S) -> None:
         """Drain outstanding work, resolve every future, join the thread."""
+        # Signal shutdown *before* contending for _close_lock: a submit() blocked
+        # on a full queue holds the lock, so setting _shutdown first is what lets
+        # it unblock and release the lock to us (rather than deadlocking here).
+        self._shutdown.set()
         with self._close_lock:
             if self._closed:
                 return
             self._closed = True
-        self._queue.put(_SENTINEL)
-        self._thread.join(timeout=30.0)
-        # Submissions that raced close() land behind the sentinel: fail them
-        # so no worker is left blocked on an orphan future.
-        while True:
-            try:
-                item = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is _SENTINEL:
-                continue
-            _, future = item
-            future.set_exception(RuntimeError("InferenceScheduler closed"))
+            # Flip _closed, join, and drain all under the lock so no submit()
+            # can enqueue a future in the window after we finish draining. The
+            # sentinel put is non-blocking: it only nudges an idle thread awake.
+            # If the queue is full the put is dropped — the thread is either
+            # actively consuming (it observes _shutdown after its next batch) or
+            # wedged in infer() (bounded by the join below), so it still exits.
+            with contextlib.suppress(queue.Full):
+                self._queue.put_nowait(_SENTINEL)
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                # A wedged detector outran the join. The scheduler thread is
+                # still the sole queue consumer; draining here would race it and
+                # swallow the sentinel, leaving it blocked forever. Leave the
+                # queue to the daemon thread — it observes _shutdown (or the
+                # sentinel) and runs its own _drain() (failing raced futures)
+                # once infer() returns. Return without claiming teardown.
+                return
+            # Submissions that raced close() land behind the sentinel: fail them
+            # so no worker is left blocked on an orphan future.
+            while True:
+                try:
+                    item = self._queue.get_nowait()
+                except queue.Empty:
+                    break
+                if item is _SENTINEL:
+                    continue
+                _, future = item
+                future.set_exception(RuntimeError("InferenceScheduler closed"))
 
     # -- scheduler thread ------------------------------------------------
     def _run(self) -> None:
         while True:
-            item = self._queue.get()
+            try:
+                # Poll rather than block forever: on a full queue close()'s
+                # sentinel put is dropped, so _shutdown is the only exit signal
+                # left once this thread has drained the backlog to empty.
+                item = self._queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._shutdown.is_set():
+                    self._drain()
+                    return
+                continue
             if item is _SENTINEL:
                 self._drain()
                 return
@@ -168,7 +228,9 @@ class InferenceScheduler:
                     break
                 batch.append(nxt)
             self._run_batch(batch)
-            if stop:
+            # _shutdown may have been set while this batch ran with the queue
+            # full (sentinel put dropped); honour it so we still tear down.
+            if stop or self._shutdown.is_set():
                 self._drain()
                 return
 
@@ -196,6 +258,10 @@ class InferenceScheduler:
                     f"detector returned {len(results)} results for {len(frames)} frames"
                 )
         except Exception as exc:
+            # Log once at the origin (this daemon thread), before fanning the
+            # failure out to every waiting future — the exception otherwise
+            # surfaces only where a future is awaited and leaves no traceback.
+            logger.exception("detector batch of %d frames failed", len(frames))
             for _, future in batch:
                 future.set_exception(exc)
             return

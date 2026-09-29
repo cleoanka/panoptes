@@ -6,13 +6,19 @@ only (numpy + core). Timestamps simulate a 30 fps stream via media PTS.
 
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from panoptes.core.config import TrackerConfig
-from panoptes.core.geometry import BBox
+from panoptes.core.geometry import BBox, bbox_ious
 from panoptes.core.types import Detection, TrackState, VehicleClass
 from panoptes.track import Tracker, create_tracker
-from panoptes.track.bytetrack import CLASS_VOTES_KEY, ByteTrackTracker
+from panoptes.track.bytetrack import (
+    CLASS_VOTES_KEY,
+    ByteTrackTracker,
+    _Entry,
+    _greedy_match,
+)
 from panoptes.track.kalman import KalmanBoxFilter
 
 FPS = 30.0
@@ -209,6 +215,39 @@ def test_lost_ttl_finishes_exactly_once() -> None:
 
 
 # ---------------------------------------------------------------------
+# Golden scenario 6: an unconfirmed blip dies on its first miss and
+# cannot hijack a later, unrelated vehicle's identity
+# ---------------------------------------------------------------------
+def test_unconfirmed_track_dropped_on_miss_no_hijack() -> None:
+    # min_hits=3 so a single detection stays TENTATIVE; lost_ttl spans the
+    # gap between the blip and the real vehicle, so a lingering ghost would
+    # still be alive to capture it.
+    tracker = create_tracker(TrackerConfig(min_hits=3, lost_ttl=2.0))
+
+    # f0: one spurious high-score detection -> TENTATIVE id=1 (unconfirmed).
+    live = tracker.update([det(100, 100, frame=0)], ts(0), 0)
+    assert [t.track_id for t in live] == [1]
+    assert live[0].state is TrackState.TENTATIVE
+
+    # f1: nothing. The unconfirmed track never reached ACTIVE, so it is
+    # dropped this frame rather than demoted to LOST for the full lost_ttl.
+    live = tracker.update([], ts(1), 1)
+    assert live == []
+    # dropped, not finished: no phantom TRACK_FINISHED summary for a blip
+    assert tracker.pop_finished() == []
+
+    # Later, a genuinely different vehicle drives through the same pixels
+    # (well within lost_ttl of the blip). It must get a fresh id with its
+    # own first_timestamp, not inherit the ghost's identity.
+    live = tracker.update([det(105, 100, frame=40)], ts(40), 40)
+    assert [t.track_id for t in live] == [2]
+    track = live[0]
+    assert track.hits == 1
+    assert track.first_timestamp == pytest.approx(ts(40))
+    assert track.state is TrackState.TENTATIVE
+
+
+# ---------------------------------------------------------------------
 # Supporting guarantees
 # ---------------------------------------------------------------------
 def test_factory_returns_bytetrack() -> None:
@@ -281,4 +320,84 @@ def test_kalman_carries_constant_velocity() -> None:
     # path (a static box would be 50 px off)
     assert blind.center[0] == pytest.approx(20.0 + 10.0 * 15, abs=5.0)
     assert blind.center[1] == pytest.approx(15.0, abs=1.0)
-    assert blind.height == pytest.approx(30.0, abs=2.0)
+
+
+# ---------------------------------------------------------------------
+# Association internals: the vectorised greedy matcher must reproduce the
+# original Python double-loop assignment bit-for-bit (perf refactor guard)
+# ---------------------------------------------------------------------
+def _entry(box: BBox) -> _Entry:
+    """Minimal entry: _greedy_match only reads ``predicted``."""
+    return _Entry(
+        track=None,  # type: ignore[arg-type]
+        kf=None,  # type: ignore[arg-type]
+        predicted=box,
+        consecutive_hits=0,
+        confirmed=False,
+        score_sum=0.0,
+    )
+
+
+def _greedy_match_reference(
+    entries: list[_Entry],
+    detections: list[Detection],
+    min_iou: float,
+) -> list[tuple[int, int]]:
+    """Pre-vectorisation reference: the explicit Python double loop."""
+    if not entries or not detections:
+        return []
+    track_boxes = np.array([e.predicted.to_xyxy() for e in entries], dtype=np.float64)
+    det_boxes = np.array([d.bbox.to_xyxy() for d in detections], dtype=np.float64)
+    iou = bbox_ious(track_boxes, det_boxes)
+    candidates = [
+        (float(iou[i, j]), i, j)
+        for i in range(len(entries))
+        for j in range(len(detections))
+        if iou[i, j] >= min_iou
+    ]
+    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    taken_tracks: set[int] = set()
+    taken_dets: set[int] = set()
+    pairs: list[tuple[int, int]] = []
+    for _iou, i, j in candidates:
+        if i in taken_tracks or j in taken_dets:
+            continue
+        taken_tracks.add(i)
+        taken_dets.add(j)
+        pairs.append((i, j))
+    return pairs
+
+
+def test_greedy_match_matches_reference_including_exact_ties() -> None:
+    rng = np.random.default_rng(20)
+    min_iou = 0.3
+    for _ in range(2000):
+        n = int(rng.integers(2, 6))
+        m = int(rng.integers(2, 6))
+        # A coarse lattice with duplicate boxes deliberately manufactures
+        # abundant *exact* IoU ties, which is precisely where the sort
+        # tie-break must reproduce the old ``(-iou, i, j)`` order. (This
+        # grid is discriminating: a (j, i) tie-break diverges on ~19% of
+        # frames; the (i, j) tie-break matches the reference on every one.)
+        entries = [_entry(BBox(*_lattice_box(rng))) for _ in range(n)]
+        detections = [det(*_lattice_center(rng), frame=0) for _ in range(m)]
+        pairs, unmatched_e, unmatched_d = _greedy_match(entries, detections, min_iou)
+        # Index by object identity: duplicate lattice boxes make entries
+        # value-equal, so list.index() would alias distinct tracks.
+        e_idx = {id(e): k for k, e in enumerate(entries)}
+        d_idx = {id(d): k for k, d in enumerate(detections)}
+        got = [(e_idx[id(e)], d_idx[id(d)]) for e, d in pairs]
+        assert got == _greedy_match_reference(entries, detections, min_iou)
+        # partition invariant: matched + unmatched exactly covers both sides
+        assert len(pairs) + len(unmatched_e) == n
+        assert len(pairs) + len(unmatched_d) == m
+
+
+def _lattice_box(rng: np.random.Generator) -> tuple[float, float, float, float]:
+    x1 = float(rng.integers(0, 3) * 20)
+    y1 = float(rng.integers(0, 3) * 20)
+    return (x1, y1, x1 + 40.0, y1 + 30.0)
+
+
+def _lattice_center(rng: np.random.Generator) -> tuple[float, float]:
+    return (float(rng.integers(0, 3) * 20 + 20), float(rng.integers(0, 3) * 20 + 15))

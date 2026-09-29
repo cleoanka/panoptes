@@ -26,6 +26,7 @@ from types import TracebackType
 from typing import Any
 
 from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DataError, IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -38,6 +39,7 @@ from panoptes.alpr.validate import normalize
 from panoptes.core.config import DatabaseConfig, PrivacyConfig
 from panoptes.core.errors import BackendUnavailableError
 from panoptes.core.events import Event, EventBus, EventType
+from panoptes.core.types import PLATE_DATA_KEYS
 from panoptes.storage.models import Base, EventRow, PlateReadRow, TrackRow
 from panoptes.storage.repos import EventRepo, PlateRepo, TrackRepo
 
@@ -47,8 +49,10 @@ logger = logging.getLogger(__name__)
 
 # event.data keys treated as plate-bearing when hashing is configured.
 # Over-matching ("text") is deliberate: hashing a non-plate string is
-# harmless, persisting a raw plate is a compliance breach.
-_PLATE_DATA_KEYS = frozenset({"plate", "plate_text", "text", "raw_text", "matched_plate"})
+# harmless, persisting a raw plate is a compliance breach. Shared with the
+# live-feed redactor (api.redact) via a single source of truth so the two
+# scrub paths can never silently diverge.
+_PLATE_DATA_KEYS = PLATE_DATA_KEYS
 
 # After this many consecutive failures of the same head batch (i.e. on the
 # 3rd attempt) flush() falls back to per-event inserts so one poison event
@@ -166,9 +170,11 @@ class Database:
         hourly loop calls this; safe to call ad hoc."""
         from panoptes.storage.retention import purge_once  # circular at module scope
 
-        if self.media_dir is None:
-            # No snapshot root known -> rows only. Passing "" would resolve
-            # to Path(".") and sweep the working directory.
+        if not self.media_dir:
+            # No snapshot root known -> rows only. A blank/empty media_dir
+            # (e.g. an exported-but-empty env var) is treated like None: "" and
+            # "." both resolve to Path(".") and would sweep the working
+            # directory, so any falsy value skips the filesystem sweep.
             privacy = self._privacy.model_copy(update={"snapshot_retention_days": None})
             return await purge_once(self, self._config, privacy, "/nonexistent")
         return await purge_once(self, self._config, self._privacy, self.media_dir)
@@ -273,21 +279,54 @@ class Database:
                     # stream's reused track ids can never overwrite history.
                     session.add(self._track_row(event))
 
+    def _build_rows(self, event: Event) -> None:
+        """Build (and discard) an event's ORM rows to surface a row-builder
+        error *before* the DB round-trip. The builders coerce free-form
+        ``event.data`` (``float``/``int`` casts), so a malformed value raises
+        ``ValueError``/``TypeError`` here rather than inside ``_flush_batch``'s
+        transaction — letting the per-event fallback classify it as permanent
+        per-row poison instead of a transient DB failure."""
+        self._event_row(event)
+        if event.type == EventType.PLATE_READ:
+            self._plate_read_row(event)
+        elif event.type == EventType.TRACK_FINISHED and event.track_id is not None:
+            self._track_row(event)
+
     async def _flush_per_event(self, batch: list[Event]) -> None:
         """Poison-batch fallback: one transaction per event so valid events
-        persist and only the individually failing ones are dropped."""
+        persist and only the genuinely poison ones are dropped.
+
+        Two kinds of per-row poison are dropped-with-log: a row-builder error
+        (``ValueError`` / ``TypeError`` from coercing malformed ``event.data``
+        *before* the DB) and a permanent DB error (``IntegrityError`` /
+        ``DataError`` — constraint violation, oversized/bad column). Probing
+        the build up front keeps that step off the requeue path, so a poison
+        event that cannot even be row-built is isolated and the buffer
+        advances instead of wedging on it forever. Any other failure
+        (``OperationalError`` "database is locked", disconnect, disk full) is
+        transient: the remaining slice is re-queued and re-raised so the next
+        flush retries it, mirroring ``_flush_batch``'s contract that a failed
+        pass never loses events."""
         for index, event in enumerate(batch):
             try:
+                self._build_rows(event)
+            except (ValueError, TypeError):
+                logger.exception(
+                    "dropping unbuildable event %s (%s)", event.id, event.type
+                )
+                continue
+            try:
                 await self._flush_batch([event])
-            except asyncio.CancelledError:
-                # Shutdown mid-pass: everything not yet committed goes back
-                # for the final flush; already-committed events stay out.
-                self._requeue(batch[index:])
-                raise
-            except Exception:
+            except (IntegrityError, DataError):
                 logger.exception(
                     "dropping unpersistable event %s (%s)", event.id, event.type
                 )
+            except BaseException:
+                # Transient (or cancellation at shutdown): everything not yet
+                # committed goes back for the next/final flush; already
+                # committed events stay out.
+                self._requeue(batch[index:])
+                raise
 
     def _requeue(self, batch: list[Event]) -> None:
         """Re-prepend a failed batch so the next flush retries it,

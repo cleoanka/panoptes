@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any, TypeVar
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 from panoptes.core.config import AppConfig
 from panoptes.core.events import EventType
@@ -31,16 +31,67 @@ __all__ = [
 
 _M = TypeVar("_M", bound=BaseModel)
 
-# scheme://userinfo@rest — the userinfo part of RTSP/DB URLs carries credentials
-_USERINFO_RE = re.compile(r"^(\w[\w+.-]*://)([^/@]+)@(.*)$")
+# scheme://rest — the userinfo part of RTSP/DB URLs carries credentials. We
+# anchor on the scheme and locate the authority explicitly rather than matching
+# the whole URL in one regex: a full-match approach fails OPEN (returns the raw
+# URL) the moment the userinfo holds a '/', which a base64/random password often
+# does (``openssl rand -base64`` emits '/'), leaking the credential verbatim.
+_SCHEME_RE = re.compile(r"^(\w[\w+.-]*://)(.*)$", re.DOTALL)
+# A bare ``host:port`` authority — the ':' is a port, NOT a credential marker.
+# A bracketed IPv6 literal (``[::1]``, ``[2001:db8::1]:554``) is a host too, so
+# its inner ':' must not read as a credential separator either (with or without
+# a trailing port).
+_HOST_PORT_RE = re.compile(r"^(?:\[[0-9A-Fa-f:]+\](?::\d+)?|[^:@/?#]+:\d+)$")
+# Some driver URLs carry the secret as a query parameter (``?password=...``)
+# instead of userinfo; mask known credential keys, the value running up to the
+# next '&' or the fragment '#'. The leading ``[?&]`` anchors on a real key start
+# so a substring like ``app_password=`` is not matched.
+_QUERY_SECRET_RE = re.compile(
+    r"([?&](?:password|passwd|pwd|secret|token)=)[^&#]*", re.IGNORECASE
+)
 
 
 def scrub_url(url: str) -> str:
-    """Mask ``user:password@`` credentials embedded in a URL."""
-    match = _USERINFO_RE.match(url)
-    if match:
-        return f"{match.group(1)}***@{match.group(3)}"
-    return url
+    """Mask ``user:password@`` credentials and ``?password=`` query secrets."""
+    match = _SCHEME_RE.match(url)
+    if not match:
+        return url
+    scheme, rest = match.group(1), match.group(2)
+    # The authority ends at the first '/', '?' or '#'. When it holds an '@' the
+    # userinfo runs up to the LAST such '@', so an unencoded '@' in the password
+    # (``user:p@ss@host``) is masked whole. Otherwise a raw '/' in the password
+    # (RFC-3986-illegal but accepted by ffmpeg/asyncpg) has pushed the '@' past
+    # that delimiter, so a tail '@' is the true userinfo terminator. A '@'
+    # sitting purely in the query/fragment is handled last by the query masker.
+    authority_end = min((i for i, c in enumerate(rest) if c in "/?#"), default=len(rest))
+    authority = rest[:authority_end]
+    at = authority.rfind("@")
+    if at != -1:
+        return _mask_query_secrets(f"{scheme}***@{rest[at + 1:]}")
+    tail_at = rest.find("@", authority_end)
+    if tail_at != -1:
+        # Fail CLOSED on a tail '@' only when the text before it is genuine
+        # userinfo, not ``host[:port]/path`` whose path merely contains an '@'.
+        # A '@' behind a '?'/'#' is in the query/fragment, never the userinfo;
+        # otherwise a credential ':' is one that survives after stripping a bare
+        # ``host:port`` prefix (so ``cam.local:554/x@`` passes through while
+        # ``user:p/w@`` masks). Residual (accepted, documented): a colon-less
+        # '/'-bearing username (``us/er@host``, no password) and a purely-digit
+        # pre-'/' password fragment (``user:12/pw@``, indistinguishable from a
+        # ``host:port`` authority) still pass through — masking either would
+        # over-mask the ubiquitous credential-free ``host:port/path@`` shape.
+        userinfo = rest[:tail_at]
+        if "?" not in userinfo and "#" not in userinfo:
+            first_slash = userinfo.index("/")  # tail_at > authority_end ⇒ a '/' exists
+            before, after = userinfo[:first_slash], userinfo[first_slash + 1 :]
+            if ":" in after or (":" in before and not _HOST_PORT_RE.match(before)):
+                return _mask_query_secrets(f"{scheme}***@{rest[tail_at + 1:]}")
+    return _mask_query_secrets(url)
+
+
+def _mask_query_secrets(url: str) -> str:
+    """Redact the value of any ``?password=``/``&token=`` credential query key."""
+    return _QUERY_SECRET_RE.sub(r"\1***", url)
 
 
 def parse_event_types(csv: str | None) -> set[str] | None:
@@ -48,14 +99,20 @@ def parse_event_types(csv: str | None) -> set[str] | None:
 
     Unknown names are dropped (lenient by design: a dashboard built against
     a newer event taxonomy must not break older servers). Returns ``None``
-    when no filtering was requested.
+    (the "no filter" sentinel) only when no filtering was requested — an
+    empty/absent ``types``. A *non-empty* ``types`` whose names are all
+    unknown yields an empty set, NOT ``None``: the client asked to narrow the
+    feed, so it must get zero events rather than silently falling back to the
+    full firehose.
     """
     if not csv:
         return None
     valid = {t.value for t in EventType}
     wanted = {part.strip().lower() for part in csv.split(",") if part.strip()}
-    wanted &= valid
-    return wanted or None
+    if not wanted:
+        # Only separators/blanks (``,,``, whitespace) — no filter requested.
+        return None
+    return wanted & valid
 
 
 def coerce(model: type[_M], row: Any) -> _M:
@@ -101,20 +158,32 @@ class EventOut(BaseModel):
 
 
 class TrackOut(BaseModel):
-    """Mirror of the storage ``tracks`` table (track summaries)."""
+    """Mirror of the storage ``tracks`` table (track summaries).
 
-    model_config = ConfigDict(from_attributes=True)
+    ``TrackRow.to_dict()`` follows the TRACK_FINISHED payload contract and emits
+    ``class``/``plate`` (not the column names). Those two fields use a
+    *validation* alias (``AliasChoices`` accepts either the payload key or the
+    Python name) so the repo dict populates them — while serialization keeps the
+    field name, so the wire shape stays ``vehicle_class``/``plate_text`` regardless
+    of FastAPI's by-alias response default.
+    """
+
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
     stream_id: str
     track_id: int
-    vehicle_class: str | None = None
+    vehicle_class: str | None = Field(
+        default=None, validation_alias=AliasChoices("class", "vehicle_class")
+    )
     first_wall_ts: float | None = None
     last_wall_ts: float | None = None
     duration_s: float | None = None
     distance_m: float | None = None
     avg_speed_kmh: float | None = None
     max_speed_kmh: float | None = None
-    plate_text: str | None = None
+    plate_text: str | None = Field(
+        default=None, validation_alias=AliasChoices("plate", "plate_text")
+    )
     plate_confidence: float | None = None
     color: str | None = None
     attributes: dict[str, Any] = Field(default_factory=dict)
@@ -169,8 +238,9 @@ class ConfigOut(BaseModel):
     """Full configuration dump with secrets redacted.
 
     Redacted: ``server.api_keys``, ``privacy.hash_salt``, webhook action
-    URLs and header values, and any ``user:password@`` credentials inside
-    stream sources / the database URL.
+    URLs and header values, and any credentials inside stream sources / the
+    database URL (both ``user:password@`` userinfo and ``?password=`` query
+    parameters).
     """
 
     model_config = ConfigDict(extra="allow")

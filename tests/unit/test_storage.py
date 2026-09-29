@@ -363,6 +363,41 @@ async def test_retention_purges_old_rows_and_snapshots(tmp_path) -> None:
     await db.disconnect()
 
 
+async def test_retention_prunes_emptied_snapshot_dirs(tmp_path) -> None:
+    db = make_db()
+    await db.connect()
+    now = time.time()
+    old_ts = now - 40 * 86_400.0  # beyond the 30-day window
+
+    # Production layout: media/<stream>/<YYYYMMDD>/<event>.jpg. One day-folder
+    # goes fully empty, a sibling keeps a fresh file, an unrelated stream is
+    # untouched — only the emptied leaf (and its now-empty stream parent) prune.
+    media = tmp_path / "media"
+    empty_day = media / "cam1" / "20250101"
+    empty_day.mkdir(parents=True)
+    stale = empty_day / "e1.jpg"
+    stale.write_bytes(b"jpeg")
+    os.utime(stale, (old_ts, old_ts))
+
+    kept_day = media / "cam2" / "20250102"
+    kept_day.mkdir(parents=True)
+    fresh = kept_day / "e2.jpg"
+    fresh.write_bytes(b"jpeg")  # current mtime — survives
+
+    counts = await purge_once(
+        db,
+        DatabaseConfig(url=MEM_URL, retention_days=None),
+        PrivacyConfig(snapshot_retention_days=30),
+        media,
+    )
+    assert counts["snapshots"] == 1
+    assert not empty_day.exists()  # emptied day-folder removed
+    assert not (media / "cam1").exists()  # its now-empty stream parent too
+    assert fresh.exists() and kept_day.exists()  # non-empty leaf untouched
+    assert media.is_dir()  # media_dir itself is never pruned
+    await db.disconnect()
+
+
 async def test_retention_none_keeps_everything(tmp_path) -> None:
     db = make_db()
     await db.connect()
@@ -415,6 +450,34 @@ async def test_retention_task_first_run_immediate_and_cancellable(tmp_path) -> N
     await db.disconnect()
 
 
+async def test_run_retention_empty_media_dir_never_sweeps_cwd(tmp_path, monkeypatch) -> None:
+    # An empty/blank media_dir (e.g. an exported-but-empty Docker/K8s env var)
+    # must be treated like None: "" -> Path(".") would otherwise rglob the CWD
+    # and unlink every stale file. Guard is `if not self.media_dir` -> rows only.
+    monkeypatch.chdir(tmp_path)
+    victim = tmp_path / "important_old_backup.txt"
+    victim.write_bytes(b"do not delete")
+    old_ts = time.time() - 100 * 86_400.0
+    os.utime(victim, (old_ts, old_ts))
+
+    db = make_db(PrivacyConfig(snapshot_retention_days=30), media_dir="")
+    await db.connect()
+    bus = EventBus()
+    db.attach(bus)
+    bus.publish(
+        Event(type=EventType.SPEEDING, stream_id="s", timestamp=0.0, wall_ts=old_ts, data={})
+    )
+    await db.flush()
+
+    counts = await db.run_retention()
+
+    assert counts["snapshots"] == 0  # no filesystem sweep happened at all
+    assert victim.exists()  # CWD untouched — the data-loss bug does not fire
+    assert counts["events"] == 1  # rows-only path still purges expired rows
+    assert await db.events.query() == []
+    await db.disconnect()
+
+
 def test_missing_async_driver_raises_backend_unavailable(monkeypatch) -> None:
     import sys
 
@@ -450,3 +513,140 @@ async def test_disconnect_flushes_pending_and_detaches() -> None:
     )
     with db._buffer_lock:
         assert db._buffer == []
+
+
+def test_plate_data_keys_single_source_of_truth() -> None:
+    # The at-rest hasher (storage.db) and the live-feed redactor (api.redact)
+    # must scrub the SAME plate-bearing keys; a divergence would leak plates in
+    # one path but not the other. Both must reference the one core constant.
+    import panoptes.api.redact as redact
+    import panoptes.storage.db as dbmod
+    from panoptes.core.types import PLATE_DATA_KEYS
+
+    assert dbmod._PLATE_DATA_KEYS is PLATE_DATA_KEYS
+    assert redact.PLATE_DATA_KEYS is PLATE_DATA_KEYS
+
+
+def _event(i: int, now: float) -> Event:
+    return Event(
+        type=EventType.LINE_CROSSED,
+        stream_id="cam1",
+        timestamp=float(i),
+        wall_ts=now + i,
+        track_id=i + 1,
+        data={},
+    )
+
+
+async def test_per_event_fallback_drops_only_poison_event() -> None:
+    # In per-event mode a genuine per-row poison (IntegrityError) is dropped,
+    # but the surrounding valid events still persist one by one.
+    from sqlalchemy.exc import IntegrityError
+
+    from panoptes.storage.db import _FLUSH_FAILURES_BEFORE_FALLBACK
+
+    db = make_db(flush_interval=60.0)  # drive flush() by hand
+    await db.connect()
+    now = time.time()
+    batch = [_event(i, now) for i in range(3)]
+    with db._buffer_lock:
+        db._buffer = list(batch)
+    db._flush_failures = _FLUSH_FAILURES_BEFORE_FALLBACK  # arm the fallback
+
+    real_flush_batch = db._flush_batch
+
+    async def flaky(one: list[Event]) -> None:
+        if one[0] is batch[1]:  # the middle event is poison
+            raise IntegrityError("INSERT", {}, Exception("UNIQUE constraint failed"))
+        await real_flush_batch(one)
+
+    db._flush_batch = flaky  # type: ignore[method-assign]
+    await db.flush()
+
+    rows = await db.events.query(stream="cam1", type="line_crossed")
+    # only the poison middle event is gone; the other two persisted
+    assert {r["timestamp"] for r in rows} == {0.0, 2.0}
+    with db._buffer_lock:
+        assert db._buffer == []  # nothing re-queued
+    await db.disconnect()
+
+
+async def test_per_event_fallback_requeues_on_transient_error() -> None:
+    # A TRANSIENT error inside per-event mode ("database is locked" etc.) must
+    # NOT drop the event: the remaining slice is re-queued and the pass
+    # re-raises, so the next flush retries it — no silent data loss.
+    from sqlalchemy.exc import OperationalError
+
+    from panoptes.storage.db import _FLUSH_FAILURES_BEFORE_FALLBACK
+
+    db = make_db(flush_interval=60.0)
+    await db.connect()
+    now = time.time()
+    batch = [_event(i, now) for i in range(3)]
+    with db._buffer_lock:
+        db._buffer = list(batch)
+    db._flush_failures = _FLUSH_FAILURES_BEFORE_FALLBACK  # arm the fallback
+
+    real_flush_batch = db._flush_batch
+
+    async def flaky(one: list[Event]) -> None:
+        if one[0] is batch[1]:  # transient blip on the middle event, once
+            raise OperationalError("INSERT", {}, Exception("database is locked"))
+        await real_flush_batch(one)
+
+    db._flush_batch = flaky  # type: ignore[method-assign]
+    with pytest.raises(OperationalError):
+        await db.flush()
+
+    # the first event committed; the failing one plus its tail are re-queued
+    with db._buffer_lock:
+        assert [e.timestamp for e in db._buffer] == [1.0, 2.0]
+
+    # a retry with the blip cleared drains everything — nothing was lost
+    db._flush_batch = real_flush_batch  # type: ignore[method-assign]
+    await db.flush()
+    rows = await db.events.query(stream="cam1", type="line_crossed")
+    assert {r["timestamp"] for r in rows} == {0.0, 1.0, 2.0}
+    await db.disconnect()
+
+
+async def test_per_event_fallback_drops_unbuildable_event() -> None:
+    # A poison event whose row cannot even be BUILT — a non-numeric confidence
+    # makes _plate_read_row's float() raise ValueError BEFORE any DB round-trip.
+    # That per-row build error must be classified as poison (dropped-with-log),
+    # NOT re-queued as transient, so the buffer advances and the surrounding
+    # valid events still persist. Regression guard: the pre-fix code caught only
+    # (IntegrityError, DataError), so the ValueError hit `except BaseException`,
+    # got re-queued and wedged the buffer forever, losing everything behind it.
+    from panoptes.storage.db import _FLUSH_FAILURES_BEFORE_FALLBACK
+
+    db = make_db(flush_interval=60.0)  # drive flush() by hand
+    await db.connect()
+    now = time.time()
+    poison = Event(
+        type=EventType.PLATE_READ,
+        stream_id="cam1",
+        timestamp=1.0,
+        wall_ts=now,
+        track_id=7,
+        data={"plate": RAW_PLATE, "confidence": "not-a-number", "valid": True},
+    )
+    valid = Event(
+        type=EventType.SPEEDING,
+        stream_id="cam1",
+        timestamp=2.0,
+        wall_ts=now,
+        data={},
+    )
+    with db._buffer_lock:
+        db._buffer = [poison, valid]
+    db._flush_failures = _FLUSH_FAILURES_BEFORE_FALLBACK  # arm the fallback
+
+    await db.flush()
+
+    # the unbuildable event is dropped; the valid one behind it still persisted
+    rows = await db.events.query(stream="cam1")
+    assert {r["type"] for r in rows} == {"speeding"}
+    with db._buffer_lock:
+        assert db._buffer == []  # nothing wedged / re-queued
+    await db.disconnect()

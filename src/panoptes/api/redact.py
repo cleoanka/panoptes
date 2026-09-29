@@ -16,12 +16,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-__all__ = ["redact_event_dict"]
+from panoptes.core.types import PLATE_DATA_KEYS
 
-# event.data keys treated as plate-bearing. Kept in sync with
-# panoptes.storage.db._PLATE_DATA_KEYS (duplicated here because the API
-# layer never imports sibling subsystems at module import time).
-_PLATE_DATA_KEYS = frozenset({"plate", "plate_text", "text", "raw_text", "matched_plate"})
+__all__ = ["redact_event_dict"]
 
 
 def _scrub(value: Any, hasher: Callable[[str], str], key: str | None = None) -> Any:
@@ -29,7 +26,7 @@ def _scrub(value: Any, hasher: Callable[[str], str], key: str | None = None) -> 
         return {k: _scrub(v, hasher, k) for k, v in value.items()}
     if isinstance(value, list):
         return [_scrub(v, hasher, key) for v in value]
-    if isinstance(value, str) and key in _PLATE_DATA_KEYS:
+    if isinstance(value, str) and key in PLATE_DATA_KEYS:
         return hasher(value)
     return value
 

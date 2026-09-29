@@ -100,5 +100,33 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # Match the actual .venv interpreter: numpy's 3.12 stubs use `type` statements
 # that mypy cannot parse under an older target (it aborts before checking).
 python_version = "3.12"
+# Third-party runtime deps (ultralytics, cv2, av, ...) ship no stubs; ignore
+# them rather than drown the gate in missing-import noise.
 ignore_missing_imports = true
 check_untyped_defs = true
+# Ratchet: every dial below already passes `mypy src` cleanly, so it costs
+# nothing today and blocks the corresponding regression tomorrow. NOTE:
+# warn_return_any and disallow_any_generics are deliberately left off — they
+# flag 7 and 6 pre-existing sites respectively (bare generics, Any returns
+# from stubless deps) that need annotation fixes in src, not a config change.
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+disallow_untyped_calls = true
+disallow_untyped_decorators = true
+disallow_subclassing_any = true
+no_implicit_optional = true
+strict_equality = true
+strict_bytes = true
+extra_checks = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unused_configs = true
+warn_no_return = true
+warn_unreachable = true
+enable_error_code = [
+  "possibly-undefined",
+  "redundant-expr",
+  "truthy-bool",
+  "ignore-without-code",
+  "redundant-self",
+]

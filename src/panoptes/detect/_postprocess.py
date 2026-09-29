@@ -77,6 +77,19 @@ COCO91_NAMES: dict[int, str] = _coco91()
 # classes can never suppress each other. Must exceed any imgsz.
 _NMS_CLASS_OFFSET = 7680.0
 
+# Hard per-image detection cap (ultralytics default). Bounds how many rows
+# leave parse_e2e / decode_classic so a misconfigured or malicious model
+# export cannot flood downstream tracking with an unbounded count.
+_MAX_DET = 300
+
+
+def _top_k_by_score(scores: np.ndarray, k: int = _MAX_DET) -> np.ndarray:
+    """Indices of the ``k`` highest-scoring rows (all of them if fewer)."""
+    n = scores.shape[0]
+    if n <= k:
+        return np.arange(n, dtype=np.int64)
+    return np.argpartition(scores, n - k)[n - k :].astype(np.int64)
+
 
 @dataclass(frozen=True, slots=True)
 class LetterboxMeta:
@@ -184,6 +197,8 @@ def parse_e2e(
     results: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
     for preds in arr:
         kept = preds[preds[:, 4] >= conf]
+        top = _top_k_by_score(kept[:, 4])  # cap flood: model did no top-K here
+        kept = kept[top]
         results.append((kept[:, :4], kept[:, 4], kept[:, 5].astype(np.int64)))
     return results
 
@@ -219,6 +234,7 @@ def decode_classic(
         xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2.0
         offsets = class_ids.astype(np.float32) * _NMS_CLASS_OFFSET
         keep = nms_numpy(xyxy + offsets[:, None], scores, iou)
+        keep = keep[_top_k_by_score(scores[keep])]  # symmetric cap after NMS
         results.append((xyxy[keep], scores[keep], class_ids[keep]))
     return results
 
@@ -249,6 +265,8 @@ def build_detections(
     ids = np.asarray(class_ids).reshape(-1)
     detections: list[Detection] = []
     for box, score, cid in zip(boxes, confs, ids, strict=True):
+        if not np.isfinite(box).all():  # drop malformed/adversarial NaN/inf boxes
+            continue
         score_f = float(score)
         if score_f < config.conf:
             continue

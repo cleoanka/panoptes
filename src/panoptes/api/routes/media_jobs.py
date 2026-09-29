@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -10,8 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 
 from panoptes.api.auth import api_key_dependency, get_state, require_component
 from panoptes.api.jobs import ProgressCallback
+from panoptes.api.redact import redact_event_dict
 from panoptes.api.schemas import JobOut
 from panoptes.core.config import StreamConfig
+from panoptes.core.types import PLATE_DATA_KEYS
 
 __all__ = ["router"]
 
@@ -78,10 +81,54 @@ async def submit_video_job(request: Request, file: UploadFile) -> dict[str, Any]
     return {"job_id": job_id}
 
 
+def _redact_result(result: dict[str, Any], state: Any) -> dict[str, Any]:
+    """Hash plate text in a batch job result when running in hashed
+    plate-storage mode; identity in plain mode.
+
+    The live feeds redact each outbound event (events.py, ws.py), but the
+    batch path collects raw events on a private bus and returns them
+    verbatim — ``events`` carries readable plates in ``data`` and ``tracks``
+    carries them at the top level (``{"track_id": ..., **event.data}``). Both
+    must go out hashed so ``GET /jobs/{id}`` matches the at-rest promise
+    (docs/PRIVACY.md), not just the SSE/WS feeds.
+    """
+    if getattr(state.config.privacy, "plate_storage", "plain") != "hashed":
+        return result
+    hasher: Callable[[str], str] | None = getattr(state.db, "hash_plate", None)
+    if hasher is None:
+        # Fail closed: hashed mode without a hasher must still never leak.
+        def hasher(_text: str) -> str:
+            return "***"
+
+    out = dict(result)
+    events = out.get("events")
+    if isinstance(events, list):
+        out["events"] = [
+            redact_event_dict(event, state) if isinstance(event, dict) else event
+            for event in events
+        ]
+    tracks = out.get("tracks")
+    if isinstance(tracks, list):
+        out["tracks"] = [
+            {
+                k: hasher(v) if isinstance(v, str) and k in PLATE_DATA_KEYS else v
+                for k, v in track.items()
+            }
+            if isinstance(track, dict)
+            else track
+            for track in tracks
+        ]
+    return out
+
+
 @router.get("/jobs/{job_id}", response_model=JobOut)
 async def get_job(request: Request, job_id: str) -> JobOut:
-    jobs = require_component(get_state(request), "jobs")
+    state = get_state(request)
+    jobs = require_component(state, "jobs")
     job = jobs.get(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail=f"unknown job: {job_id}")
+    result = job.get("result")
+    if isinstance(result, dict):
+        job = {**job, "result": _redact_result(result, state)}
     return JobOut(job_id=job_id, **job)

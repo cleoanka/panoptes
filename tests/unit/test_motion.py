@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from panoptes.core.config import CalibrationConfig, SpeedConfig
+from panoptes.core.config import CalibrationConfig, SpeedConfig, StoppedVehicleConfig
 from panoptes.core.errors import CalibrationError
 from panoptes.core.events import EventType
 from panoptes.core.geometry import BBox
@@ -125,6 +125,40 @@ def test_no_speed_across_reacquisition_gap() -> None:
     assert track.speed_kmh is None
 
 
+def test_reference_never_taken_from_before_the_window() -> None:
+    # Two grounded points inside the 1 s window satisfy the guard, but a
+    # pre-gap point sits *just* before window_start. Measuring against that
+    # closer-to-the-boundary point would span the occlusion; the reference
+    # must come from inside the window instead.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    for t in (0.0, 4.0, 8.0, 8.9):  # parked at 10 m, last hit just pre-window
+        advance(track, t, 100.0, 50.0)
+    advance(track, 9.5, 105.0, 50.0)  # re-acquired: +0.5 m ground
+    advance(track, 10.0, 106.0, 50.0)  # +0.1 m more, window_start = 9.0
+    estimator.process([track], "cam1", WALL_T0 + 10.0)
+    # In-window motion is 0.1 m over 0.5 s == 0.72 km/h. Referencing the
+    # pre-window point (8.9 s, 10 m) would give 0.6 m / 1.1 s ~ 1.96 km/h.
+    assert track.speed_kmh == pytest.approx(0.72, rel=1e-3)
+
+
+def test_short_baseline_reference_does_not_seed_ema_from_jitter() -> None:
+    # A parked car re-acquired after a long occlusion: an old first point
+    # makes the track pass min_track_s, then only two fresh points sit inside
+    # the 1 s window, clustered near the newest frame with +-1 px bbox jitter.
+    # The earliest in-window reference then gives a 0.1 s baseline, and the
+    # 2 px jitter over that dt would seed the EMA at a bogus ~7.2 km/h. The
+    # estimate must be deferred until a full-window baseline exists.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    advance(track, 0.0, 100.0, 50.0)  # old point: track is old enough
+    advance(track, 9.9, 99.0, 50.0)   # re-acquired; earliest in-window, trough
+    advance(track, 9.95, 101.0, 50.0)
+    advance(track, 10.0, 101.0, 50.0)  # current, peak; window_start = 9.0
+    estimator.process([track], "cam1", WALL_T0 + 10.0)
+    assert track.speed_kmh is None
+
+
 # ----------------------------------------------------------------------
 # golden: SPEEDING events
 # ----------------------------------------------------------------------
@@ -167,6 +201,159 @@ def test_under_limit_no_events() -> None:
     track = make_track()
     events = run_constant_velocity(estimator, track, seconds=3.0)
     assert events == []
+
+
+# ----------------------------------------------------------------------
+# golden: STOPPED_VEHICLE events
+# ----------------------------------------------------------------------
+def run_stationary(
+    estimator: MotionEstimator,
+    track: Track,
+    *,
+    seconds: float,
+    fps: float = 10.0,
+    at: tuple[float, float] = (50.0, 50.0),
+):
+    """Park a vehicle at a fixed pixel: one point + one process() per frame."""
+    events = []
+    for i in range(round(seconds * fps) + 1):
+        t = i / fps
+        advance(track, t, at[0], at[1])
+        events.extend(estimator.process([track], "cam1", WALL_T0 + t))
+    return events
+
+
+def test_stopped_fires_once_after_dwell() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=5.0)
+    stops = [e for e in events if e.type is EventType.STOPPED_VEHICLE]
+    assert len(stops) == 1
+    event = stops[0]
+    assert event.stream_id == "cam1"
+    assert event.track_id == 1
+    assert event.vehicle_class == "car"
+    assert event.data["threshold_kmh"] == 3.0
+    assert event.data["speed_kmh"] <= 3.0
+    assert event.data["stopped_s"] >= 2.0
+    assert event.wall_ts == pytest.approx(WALL_T0 + event.timestamp)
+    assert track.data["stopped_emitted_ts"] == pytest.approx(event.timestamp)
+
+
+def test_stopped_reemits_after_30s() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=35.0)
+    stops = [e for e in events if e.type is EventType.STOPPED_VEHICLE]
+    assert len(stops) == 2
+    assert stops[1].timestamp - stops[0].timestamp >= 30.0
+
+
+def test_stopped_disabled_by_default() -> None:
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=5.0)
+    assert [e for e in events if e.type is EventType.STOPPED_VEHICLE] == []
+
+
+def test_stopped_not_fired_while_moving() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=5.0)  # 72 km/h
+    assert [e for e in events if e.type is EventType.STOPPED_VEHICLE] == []
+
+
+def test_stopped_dwell_resets_when_vehicle_moves() -> None:
+    from panoptes.motion.estimator import _STOPPED_SINCE_KEY
+
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=5.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(stopped=stopped))
+    track = make_track()
+    fps = 10.0
+    # Park briefly (under the 5 s dwell): stopped_since is recorded.
+    for i in range(20):  # t = 0.0 .. 1.9
+        t = i / fps
+        advance(track, t, 50.0, 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+    assert _STOPPED_SINCE_KEY in track.data
+    # Now drive off from where it stopped: the dwell must clear.
+    for i in range(20, 40):  # t = 2.0 .. 3.9, +20 px/step == 72 km/h
+        t = i / fps
+        advance(track, t, 50.0 + 20.0 * (i - 19), 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+    assert track.speed_kmh is not None and track.speed_kmh > 3.0
+    assert _STOPPED_SINCE_KEY not in track.data
+
+
+def test_stopped_requires_calibration() -> None:
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=2.0)
+    estimator = MotionEstimator(None, SpeedConfig(stopped=stopped))
+    track = make_track()
+    events = run_stationary(estimator, track, seconds=5.0)
+    assert events == []
+    assert track.speed_kmh is None
+
+
+def test_no_phantom_stopped_across_reacquisition_gap() -> None:
+    from panoptes.motion.estimator import _STOPPED_SINCE_KEY
+
+    # A vehicle sits stationary only briefly (under the 5 s dwell), then goes
+    # LOST for 5 s during which it actually drives 40 m away, and is
+    # re-acquired far from where it stopped. The stale near-zero speed and a
+    # pre-gap stopped_since must not fabricate a STOPPED_VEHICLE whose
+    # stopped_s spans the occlusion.
+    stopped = StoppedVehicleConfig(enabled=True, max_speed_kmh=3.0, min_stopped_s=5.0)
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(window_s=1.0, stopped=stopped))
+    track = make_track()
+    events = []
+    for i in range(11):  # t = 0.0 .. 1.0, parked -> speed_kmh -> 0.0
+        t = i / 10.0
+        advance(track, t, 50.0, 50.0)
+        events.extend(estimator.process([track], "cam1", WALL_T0 + t))
+    assert track.speed_kmh == pytest.approx(0.0, abs=1e-9)
+    assert _STOPPED_SINCE_KEY in track.data  # dwell started but under 5 s
+    # LOST 5 s, re-acquired 40 m (400 px) away -> demonstrably moving.
+    advance(track, 6.0, 450.0, 50.0)
+    events.extend(estimator.process([track], "cam1", WALL_T0 + 6.0))
+    assert [e for e in events if e.type is EventType.STOPPED_VEHICLE] == []
+    # Stale speed invalidated and the dwell cleared: no phantom state remains.
+    assert track.speed_kmh is None
+    assert _STOPPED_SINCE_KEY not in track.data
+
+
+def test_no_phantom_speeding_across_reacquisition_gap() -> None:
+    # Symmetric SPEEDING case: a track speeding well over the limit, then LOST
+    # long enough that the re-emit throttle is satisfied, then re-acquired
+    # parked. The stale-high speed must not re-fire SPEEDING across the gap.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig(limit_kmh=60.0))
+    track = make_track()
+    events = run_constant_velocity(estimator, track, seconds=3.0)  # 72 km/h
+    assert [e for e in events if e.type is EventType.SPEEDING]  # sanity: fired
+    assert track.speed_kmh is not None and track.speed_kmh > 60.0
+    # LOST 40 s (past the 30 s throttle), re-acquired parked at the last pixel.
+    last_cx = track.points[-1].bbox.bottom_center[0]
+    advance(track, 43.0, last_cx, 50.0)
+    reacquire = estimator.process([track], "cam1", WALL_T0 + 43.0)
+    assert [e for e in reacquire if e.type is EventType.SPEEDING] == []
+    assert track.speed_kmh is None
+
+
+def test_speed_re_establishes_after_reacquisition_gap() -> None:
+    # Regression guard: invalidating on the gap must not permanently disable
+    # the estimator. Once fresh in-window points accumulate after the gap, a
+    # real windowed speed is produced again.
+    estimator = MotionEstimator(square_calibration(), SpeedConfig())
+    track = make_track()
+    run_constant_velocity(estimator, track, seconds=1.5)  # 72 km/h, then LOST
+    base = track.points[-1].timestamp
+    for i in range(16):  # t = base+5.0 .. base+6.5, driving 72 km/h again
+        t = base + 5.0 + i / 10.0
+        advance(track, t, 20.0 * i, 50.0)
+        estimator.process([track], "cam1", WALL_T0 + t)
+    assert track.speed_kmh == pytest.approx(72.0, rel=0.05)
 
 
 # ----------------------------------------------------------------------

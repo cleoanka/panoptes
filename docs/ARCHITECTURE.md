@@ -208,7 +208,9 @@ overlays, all cv2 primitives).
 
 ```python
 from panoptes.storage import Database
-Database(config: DatabaseConfig, privacy: PrivacyConfig)
+Database(config: DatabaseConfig, privacy: PrivacyConfig, *, media_dir=None)
+  # media_dir (server.media_dir) is the snapshot root; without it
+  # run_retention() downgrades to rows-only and never sweeps files.
   await .connect() / .disconnect()      # create_all on connect
   .attach(bus: EventBus)                # sync handler -> thread-safe buffer -> async flush task
   .events / .tracks / .plates          # repositories
@@ -242,7 +244,8 @@ GET  /api/v1/streams/{id}/analytics           # line/zone counter summary
 GET  /api/v1/events?stream=&type=&class=&since=&until=&limit=&offset=
 GET  /api/v1/events/stream                    # SSE (hand-rolled, text/event-stream)
 WS   /api/v1/events/ws
-GET  /api/v1/plates?q=&stream=&since=&limit=  # plate search
+GET  /api/v1/tracks?stream=&class=&plate=&since=&limit=&offset=  # track-summary history
+GET  /api/v1/plates?q=&stream=&since=&limit=&offset=  # plate search
 POST /api/v1/jobs/video                       # upload -> background processing -> job id
 GET  /api/v1/jobs/{id}                        # status/progress/result json
 GET  /media/{path}                            # snapshots (auth'd)

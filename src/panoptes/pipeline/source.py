@@ -165,7 +165,6 @@ class OpenCvSource(FrameSource):
             count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.frame_count = count if count > 0 else None
         self._file_frame_index = -1
-        self._backoff_reset()
         return True
 
     def __next__(self) -> FramePacket:
@@ -201,6 +200,10 @@ class OpenCvSource(FrameSource):
                         raise StreamSourceError(f"cannot reopen looped file: {self._source}")
                     continue
                 raise StopIteration
+            # a delivered frame is the only proof the source is healthy: reset
+            # here (not on open) so a source that opens but never streams still
+            # rides the 1s -> 30s backoff instead of a ~1s reconnect loop
+            self._backoff_reset()
             self._emitted_index += 1
             self._file_frame_index += 1
             timestamp = self._timestamp()
@@ -270,7 +273,6 @@ class PyAvSource(FrameSource):
             self._release()
             return False
         self._pts0 = None
-        self._backoff_reset()
         return True
 
     def _release(self) -> None:
@@ -296,6 +298,9 @@ class PyAvSource(FrameSource):
             except Exception as exc:
                 self._reconnect(f"decode failed: {exc}")
                 continue
+            # proven-healthy frame: reset here (not on open) so a source that
+            # opens but never decodes keeps the 1s -> 30s backoff
+            self._backoff_reset()
             timestamp = self._pts_timestamp(frame)
             self._last_ts = timestamp
             image = frame.to_ndarray(format="bgr24")  # type: ignore[attr-defined]

@@ -33,6 +33,17 @@ from panoptes.detect.base import Detector
 __all__ = ["OnnxDetector", "parse_names_metadata"]
 
 
+def _coerce_names(mapping: dict[Any, Any]) -> dict[int, str]:
+    """Coerce a user-supplied ``config.extra["names"]`` mapping to the
+    ``{int: str}`` class map. YAML mappings arrive with string keys, so a
+    non-int-coercible key falls back to the COCO-80 table rather than
+    aborting detector construction with a raw ``ValueError``."""
+    try:
+        return {int(k): str(v) for k, v in mapping.items()}
+    except (TypeError, ValueError):
+        return dict(COCO80_NAMES)
+
+
 def parse_names_metadata(raw: str | None) -> dict[int, str]:
     """Parse the ``names`` metadata value ultralytics embeds in ONNX
     exports — a python-dict string like ``"{0: 'person', 1: 'bicycle'}"``.
@@ -44,7 +55,10 @@ def parse_names_metadata(raw: str | None) -> dict[int, str]:
     except (ValueError, SyntaxError):
         return dict(COCO80_NAMES)
     if isinstance(value, dict):
-        return {int(k): str(v) for k, v in value.items()}
+        try:
+            return {int(k): str(v) for k, v in value.items()}
+        except (TypeError, ValueError):
+            return dict(COCO80_NAMES)
     if isinstance(value, (list, tuple)):
         return {i: str(v) for i, v in enumerate(value)}
     return dict(COCO80_NAMES)
@@ -94,7 +108,7 @@ class OnnxDetector(Detector):
         self._input_dtype = np.float16 if "float16" in input_type else np.float32
         extra_names = config.extra.get("names")
         if isinstance(extra_names, dict):
-            self._names = {int(k): str(v) for k, v in extra_names.items()}
+            self._names = _coerce_names(extra_names)
         else:
             meta = self._session.get_modelmeta()
             custom = getattr(meta, "custom_metadata_map", None) or {}

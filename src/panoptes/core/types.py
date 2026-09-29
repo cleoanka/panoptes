@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 __all__ = [
+    "PLATE_DATA_KEYS",
     "AttributeValue",
     "Detection",
     "FramePacket",
@@ -33,6 +34,12 @@ __all__ = [
     "TrackState",
     "VehicleClass",
 ]
+
+# event.data keys whose string values carry a readable plate. The single source
+# of truth for both at-rest hashing (storage.db) and outbound live-feed
+# redaction (api.redact) — a divergence here would silently leak plates in one
+# path but not the other, so both import this rather than keep private copies.
+PLATE_DATA_KEYS = frozenset({"plate", "plate_text", "text", "raw_text", "matched_plate"})
 
 
 class VehicleClass(StrEnum):

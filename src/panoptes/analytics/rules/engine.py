@@ -191,6 +191,19 @@ class RulesEngine:
                 if rule.actions:
                     dispatcher = self._dispatcher or ActionDispatcher.shared()
                     dispatcher.dispatch(triggered, rule.actions)
+        # Drop per-track cooldown state for tracks that finished this frame
+        # (after firing, so a final-frame trigger is preserved). track_id is
+        # never reused, so those entries could otherwise leak forever; this
+        # bounds _last_fired to O(live tracks * rules). Rule-level (id, None)
+        # entries stay.
+        finished = {
+            e.track_id
+            for e in primitive_events
+            if e.type == EventType.TRACK_FINISHED and e.track_id is not None
+        }
+        if finished:
+            for key in [k for k in self._last_fired if k[1] in finished]:
+                del self._last_fired[key]
         return fired
 
     # -- trigger checks ---------------------------------------------------

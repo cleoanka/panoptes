@@ -59,15 +59,38 @@ async def purge_once(
         cutoff = now - privacy_cfg.snapshot_retention_days * _DAY_S
         root = Path(media_dir)
         if root.is_dir():
+            # Snapshots live at media_dir/<stream>/<YYYYMMDD>/<event>.jpg; once a
+            # day-folder loses its last file it would linger forever, so track the
+            # dirs we emptied and rmdir them bottom-up below (never media_dir).
+            emptied: set[Path] = set()
             for path in root.rglob("*"):
                 try:
                     if path.is_file() and path.stat().st_mtime < cutoff:
                         path.unlink(missing_ok=True)
                         counts["snapshots"] += 1
+                        emptied.add(path.parent)
                 except OSError:
                     continue  # file vanished / permission issue: next sweep retries
+            _prune_empty_dirs(emptied, root)
 
     return counts
+
+
+def _prune_empty_dirs(dirs: set[Path], root: Path) -> None:
+    """Remove now-empty snapshot dirs bottom-up, stopping at ``root``.
+
+    Deepest paths first so a day-folder is gone before its stream-folder is
+    reconsidered; ``root`` itself is never removed. ``rmdir`` fails on a
+    non-empty dir, which is exactly the guard we want.
+    """
+    for path in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
+        current = path
+        while current != root and root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break  # not empty (or vanished / permission): leave it in place
+            current = current.parent
 
 
 async def retention_task(
