@@ -68,8 +68,9 @@ class AttributePipeline:
 
     def process(self, frame: np.ndarray, tracks: list[Track], frame_index: int) -> None:
         """Observe ACTIVE tracks on cadence; fused values land in
-        ``track.attributes``. FINISHED tracks in ``tracks`` release their
-        fusion state."""
+        ``track.attributes``. Fusion state for tracks that have finished or
+        vanished from ``tracks`` is released, so a long-lived stream does not
+        accumulate evidence for retired tracks."""
         # A stream restart rewinds frame_index; reset the schedule or the
         # extractors would sleep until the previous high-water mark.
         if self._last_frame_index is not None and frame_index < self._last_frame_index:
@@ -90,9 +91,13 @@ class AttributePipeline:
                 value, confidence = observation
                 self.fuser.observe(track, extractor.attribute_key, value, confidence)
 
-        for track in tracks:
-            if track.state is TrackState.FINISHED:
-                self.fuser.forget(track.track_id)
+        # Free fusion state for tracks that finished or dropped out of the
+        # scene. The real tracker retires a FINISHED track by removing it from
+        # the live list (it never reappears here), so pruning against the live
+        # id set — like ALPR's voter prune — is what actually releases memory.
+        live = {t.track_id for t in tracks if t.state is not TrackState.FINISHED}
+        for track_id in self.fuser.tracked_ids() - live:
+            self.fuser.forget(track_id)
 
     def forget(self, track_id: int) -> None:
         """Release fusion state for a finished track. The worker should

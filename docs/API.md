@@ -98,7 +98,8 @@ The full validated configuration with secrets redacted: `server.api_keys`
 values become `"***"`, `privacy.hash_salt` becomes `"***"`, webhook action
 URLs and header values become `"***"`, and `user:password@` credentials
 inside stream sources and the database URL are masked
-(`rtsp://***@10.0.0.11:554/stream1`).
+(`rtsp://***@10.0.0.11:554/stream1`). With `privacy.plate_storage: hashed`,
+watchlist plates are returned as `"***"` as well.
 
 ---
 
@@ -282,7 +283,9 @@ asyncio.run(main())
 | `q` | string | Plate text, substring match (hashed mode: exact full plate) |
 | `stream` | string | Stream id filter |
 | `since` | float | Minimum `wall_ts` (UNIX seconds) |
+| `until` | float | Maximum `wall_ts` (UNIX seconds) |
 | `limit` | int 1–1000 | Page size (default 100) |
+| `offset` | int ≥ 0 | Pagination offset |
 
 ```json
 [
@@ -306,6 +309,56 @@ hash, not readable text. See [PRIVACY.md](PRIVACY.md).
 
 ---
 
+## Tracks
+
+### `GET /api/v1/tracks` — track-summary history
+
+One row per finished track (written on `TRACK_FINISHED`), mirroring the
+storage `tracks` table.
+
+| Param | Type | Meaning |
+|---|---|---|
+| `stream` | string | Stream id filter |
+| `class` | string | Vehicle class filter (`422` on unknown values) |
+| `plate` | string | Plate text, exact match (hashed mode: exact full plate) |
+| `since` | float | Minimum `last_wall_ts` (UNIX seconds) |
+| `until` | float | Maximum `last_wall_ts` (UNIX seconds) |
+| `limit` | int 1–1000 | Page size (default 100) |
+| `offset` | int ≥ 0 | Pagination offset |
+
+```bash
+curl -H "X-API-Key: KEY" \
+  "http://host:8080/api/v1/tracks?stream=cam-north&class=truck&limit=50"
+```
+
+Returns a JSON array of Track objects:
+
+```json
+[
+  {
+    "stream_id": "cam-north",
+    "track_id": 17,
+    "vehicle_class": "truck",
+    "first_wall_ts": 1783938440.021,
+    "last_wall_ts": 1783938446.512,
+    "duration_s": 6.49,
+    "distance_m": 84.2,
+    "avg_speed_kmh": 46.7,
+    "max_speed_kmh": 58.3,
+    "plate_text": "34ABC123",
+    "plate_confidence": 0.94,
+    "color": "white",
+    "attributes": {}
+  }
+]
+```
+
+When `privacy.plate_storage: hashed` is configured, the repository hashes
+`plate` before matching, so exact full-plate lookup still works while the
+returned `plate_text` field carries the hash. See [PRIVACY.md](PRIVACY.md).
+
+---
+
 ## Video jobs
 
 Batch-process an uploaded video through the full pipeline (detection →
@@ -316,7 +369,10 @@ tracking → analytics → events) without configuring a stream.
 Multipart upload, field name `file`. Accepted extensions: `.mp4 .avi .mkv
 .mov .ts .webm .m4v .mpg .mpeg` (anything else is stored as `.mp4`). Uploads
 larger than `server.max_upload_mb` are rejected with `413`; empty uploads
-with `400`.
+with `400`. The API key is checked before any of the body is read, and the
+size limit is enforced while the upload streams in (an oversized
+`Content-Length` is refused unread); a partially written file from a rejected
+upload is deleted before the error is returned.
 
 ```bash
 curl -H "X-API-Key: KEY" -F "file=@traffic.mp4" \

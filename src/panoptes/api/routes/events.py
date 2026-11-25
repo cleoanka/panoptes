@@ -16,6 +16,7 @@ from panoptes.api.auth import api_key_dependency, get_state, require_component
 from panoptes.api.redact import redact_event_dict
 from panoptes.api.schemas import EventOut, coerce, parse_event_types
 from panoptes.core.events import EventType
+from panoptes.core.jsonsafe import finite as _finite
 from panoptes.core.types import VehicleClass
 
 __all__ = ["router"]
@@ -23,6 +24,18 @@ __all__ = ["router"]
 router = APIRouter(dependencies=[Depends(api_key_dependency)])
 
 _KEEPALIVE_S = 15.0  # SSE comment ping period so proxies don't cut idle streams
+
+
+class _EventStreamResponse(StreamingResponse):
+    """A ``StreamingResponse`` whose media type is fixed to ``text/event-stream``.
+
+    FastAPI cannot infer the media type of a bare ``StreamingResponse`` and
+    falls back to ``application/json`` in the OpenAPI spec. Declaring this as
+    the route's ``response_class`` makes the documented 200 content type match
+    what the endpoint actually emits, so codegen clients expect SSE, not JSON.
+    """
+
+    media_type = "text/event-stream"
 
 
 def _validated(value: str | None, enum: type[Enum], param: str) -> str | None:
@@ -35,6 +48,19 @@ def _validated(value: str | None, enum: type[Enum], param: str) -> str | None:
         raise HTTPException(
             status_code=422, detail=f"invalid {param} '{value}'; expected one of: {allowed}"
         ) from exc
+
+
+def _strict_json(payload: dict[str, Any]) -> str:
+    # Match the REST layer's serializer (Starlette JSONResponse uses
+    # allow_nan=False): NaN/Infinity are not valid JSON and break strict
+    # parsers. A non-finite float can reach the live feed via event.data
+    # (e.g. a speed estimate before enough samples). Coerce those to null
+    # rather than letting json.dumps emit non-standard tokens, and keep the
+    # SSE generator alive instead of raising mid-stream.
+    try:
+        return json.dumps(payload, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(payload), allow_nan=False)
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -51,8 +77,15 @@ async def list_events(
     stream: str | None = Query(None, description="stream id filter"),
     type_: str | None = Query(None, alias="type", description="event type filter"),
     vehicle_class: str | None = Query(None, alias="class", description="vehicle class filter"),
-    since: float | None = Query(None, description="minimum wall_ts (UNIX seconds)"),
-    until: float | None = Query(None, description="maximum wall_ts (UNIX seconds)"),
+    # Reject NaN/Infinity: Pydantic defaults allow_inf_nan=True, but a non-finite
+    # bound reaches the repo as ``WHERE wall_ts >= NaN`` which matches nothing
+    # (NaN comparisons are always False), silently returning an empty history.
+    since: float | None = Query(
+        None, description="minimum wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
+    until: float | None = Query(
+        None, description="maximum wall_ts (UNIX seconds)", allow_inf_nan=False
+    ),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
 ) -> list[EventOut]:
@@ -73,7 +106,7 @@ async def list_events(
     return [coerce(EventOut, row) for row in rows]
 
 
-@router.get("/stream")
+@router.get("/stream", response_class=_EventStreamResponse)
 async def stream_events(
     request: Request,
     types: str | None = Query(None, description="comma-separated event types to forward"),
@@ -97,22 +130,24 @@ async def stream_events(
                 except TimeoutError:
                     yield ": ping\n\n"
                 else:
-                    if wanted is not None and event.type.value not in wanted:
-                        continue
-                    # In hashed plate-storage mode the live feed must match
-                    # the at-rest representation: plate text goes out hashed.
-                    yield f"data: {json.dumps(redact_event_dict(event.to_dict(), state))}\n\n"
-                    sent += 1
-                    if limit is not None and sent >= limit:
-                        return
+                    # A filtered-out event yields nothing, but must still fall
+                    # through to the disconnect check below: otherwise a busy
+                    # all-filtered stream never times out and a dead client
+                    # leaks its bus subscription (its queue is drained forever).
+                    if wanted is None or event.type.value in wanted:
+                        # In hashed plate-storage mode the live feed must match
+                        # the at-rest representation: plate text goes out hashed.
+                        yield f"data: {_strict_json(redact_event_dict(event.to_dict(), state))}\n\n"
+                        sent += 1
+                        if limit is not None and sent >= limit:
+                            return
                 if await request.is_disconnected():
                     return
         finally:
             bus.unsubscribe(sub_id)
 
-    return StreamingResponse(
+    return _EventStreamResponse(
         generate(),
-        media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",

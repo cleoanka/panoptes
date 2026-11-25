@@ -89,9 +89,12 @@ violations you enforce).
 
 - Every API endpoint except the health probe requires an API key when
   `server.api_keys` is set; snapshots under `/media/{path}` are served
-  only through the authenticated route.
+  only through the authenticated route. Exceptions by design: `/metrics`
+  (Prometheus scrape; stream ids and traffic volumes, no plates or
+  imagery — see [DEPLOYMENT.md](DEPLOYMENT.md)) and the static dashboard
+  assets, which hold no data.
 - Camera credentials, API keys and webhook auth headers are redacted from
-  `GET /api/v1/system/config` output.
+  `GET /api/v1/system/config` output; in hashed mode so are watchlist plates.
 - `/metrics` exposes only operational aggregates (frame counts, event
   counts by type, FPS) — no plates, no imagery.
 
@@ -149,16 +152,21 @@ alpr:
   enabled: true            # only if plates are actually needed for the purpose
 privacy:
   plate_storage: hashed
-  hash_salt: ""            # injected: PANOPTES_PRIVACY__HASH_SALT
+  # hash_salt omitted on purpose: inject PANOPTES_PRIVACY__HASH_SALT
   snapshot_retention_days: 14
 database:
   retention_days: 30
 snapshots:
   on_events: [watchlist_hit, wrong_way]   # evidence-grade events only
   max_per_minute: 30
-server:
-  api_keys: []             # injected: PANOPTES_SERVER__API_KEYS
+# server.api_keys omitted on purpose: inject PANOPTES_SERVER__API_KEYS
 ```
+
+Leave `hash_salt` and `server.api_keys` **out of the YAML** and inject them
+via env — a value present in YAML (even `""` or `[]`) takes precedence over
+its environment override and would silently shadow it, disabling auth or
+pinning an empty salt. Same rule as the
+[DEPLOYMENT.md](DEPLOYMENT.md) precedence caveat.
 
 Start from the minimum that serves the documented purpose and widen only
 with a reason you would be comfortable writing into the DPIA.

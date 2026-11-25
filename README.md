@@ -30,8 +30,10 @@ dashboard.
   constant-velocity Kalman filter, written from the published algorithm —
   no AGPL tracker dependency in the product path.
 - **Calibrated speed, honestly.** Image-to-ground homography, windowed
-  displacement over media PTS (never wall clock, never frame-to-frame),
-  EMA smoothing. No calibration → no speed claims.
+  displacement over stream time (never frame-to-frame), EMA smoothing. Files
+  and PyAV live streams use media PTS; OpenCV live sources (RTSP/HTTP without
+  PyAV, webcams) use host monotonic capture time. Never the UNIX wall clock.
+  No calibration → no speed claims.
 - **Declarative rules DSL.** Wrong-way, dwell, speed-by-class, watchlists and
   compound `all_of`/`any_of` conditions with webhook/snapshot/log actions —
   all in YAML, validated at startup. See [docs/RULES.md](docs/RULES.md).
@@ -63,7 +65,7 @@ dashboard.
 | API | REST + SSE + WebSocket + MJPEG + video jobs | `panoptes.api` |
 | Storage | SQLite/PostgreSQL, batched writes, retention | `panoptes.storage` |
 | Observability | Prometheus metrics, structlog | `panoptes.observability` |
-| CLI | serve, process, demo, benchmark, calibrate, export | `panoptes.cli` |
+| CLI | serve, process, demo, benchmark, calibrate, validate-config, export | `panoptes.cli` |
 
 ## 60-second quickstart
 
@@ -124,8 +126,10 @@ One process. The thread/async boundary is crossed in exactly two places: the
 
 ## Configuration teaser
 
-One YAML file declares everything; every field has an env override
-(`PANOPTES_SERVER__PORT=9000`). Full example: [examples/panoptes.yaml](examples/panoptes.yaml).
+One YAML file declares everything; any field *not* set in the YAML can be
+supplied via an env override (`PANOPTES_SERVER__PORT=9000`) — but a value set
+in YAML takes precedence and silently shadows its env override. Full example:
+[examples/panoptes.yaml](examples/panoptes.yaml).
 
 ```yaml
 detector:

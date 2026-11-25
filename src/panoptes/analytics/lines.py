@@ -91,6 +91,9 @@ class LineCounter:
             ):
                 state["crossed"] = True
                 events.append(self._count(track, cross, timestamp, wall_ts))
+                wrong_way = self._wrong_way(track, cross, timestamp, wall_ts)
+                if wrong_way is not None:
+                    events.append(wrong_way)
 
             sign = _sign(self.segment.side(*anchor))
             if sign != 0:  # exactly on the line: keep prior side, freeze debounce
@@ -120,5 +123,31 @@ class LineCounter:
                 "direction": label,
                 "direction_canonical": "forward" if cross > 0 else "backward",
                 "count": sum(per_class.values()),
+            },
+        )
+
+    def _wrong_way(
+        self, track: Track, cross: int, timestamp: float, wall_ts: float
+    ) -> Event | None:
+        """Emit a WRONG_WAY primitive when the crossing opposes the allowed
+        direction. ``None`` (the default) leaves the line bidirectional."""
+        allowed = self.config.allowed_direction
+        if allowed is None:
+            return None
+        observed = "forward" if cross > 0 else "backward"
+        if observed == allowed:
+            return None
+        return Event(
+            type=EventType.WRONG_WAY,
+            stream_id=track.stream_id,
+            timestamp=timestamp,
+            wall_ts=wall_ts,
+            track_id=track.track_id,
+            vehicle_class=track.vehicle_class.value,
+            data={
+                "line": self.config.id,
+                "line_name": self.config.name,
+                "direction_canonical": observed,
+                "allowed_direction": allowed,
             },
         )

@@ -9,12 +9,15 @@ published after the client sees the connection open can be missed.
 from __future__ import annotations
 
 import asyncio
+import json
+from typing import Any
 
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
 from panoptes.api.auth import extract_api_key, key_is_valid
 from panoptes.api.redact import redact_event_dict
 from panoptes.api.schemas import parse_event_types
+from panoptes.core.jsonsafe import finite as _finite
 
 __all__ = ["router"]
 
@@ -23,6 +26,18 @@ router = APIRouter()
 # Application-defined close codes (4000-4999 range per RFC 6455).
 _CLOSE_UNAUTHORIZED = 4401
 _CLOSE_NOT_READY = 4503
+
+
+def _strict_json(payload: dict[str, Any]) -> str:
+    # Mirror the SSE feed's serializer (routes/events.py): Starlette's
+    # WebSocket.send_json uses the default allow_nan=True, which emits
+    # NaN/Infinity -- invalid JSON that breaks strict clients. A non-finite
+    # float can reach the live feed via event.data (e.g. an early speed
+    # estimate), so coerce those to null rather than emit non-standard tokens.
+    try:
+        return json.dumps(payload, allow_nan=False)
+    except ValueError:
+        return json.dumps(_finite(payload), allow_nan=False)
 
 
 @router.websocket("/events/ws")
@@ -72,7 +87,11 @@ async def events_ws(
                 try:
                     # In hashed plate-storage mode the live feed must match
                     # the at-rest representation: plate text goes out hashed.
-                    await websocket.send_json(redact_event_dict(event.to_dict(), state))
+                    # send_text (not send_json) so _strict_json can coerce any
+                    # non-finite float to null instead of emitting NaN/Infinity.
+                    await websocket.send_text(
+                        _strict_json(redact_event_dict(event.to_dict(), state))
+                    )
                 except (WebSocketDisconnect, RuntimeError):
                     break
     finally:

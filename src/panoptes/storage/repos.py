@@ -83,12 +83,13 @@ class TrackRepo:
         vehicle_class: str | None = None,
         plate: str | None = None,
         since: float | None = None,
+        until: float | None = None,
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Track summaries, most recently finished first. The ``plate``
         filter is an exact match on the at-rest value (hash or normalized
-        text)."""
+        text). ``since``/``until`` bound ``last_wall_ts`` (UNIX seconds)."""
         limit, offset = _clamp(limit, offset)
         stmt = select(TrackRow).order_by(TrackRow.last_wall_ts.desc(), TrackRow.track_id)
         if stream is not None:
@@ -100,6 +101,8 @@ class TrackRepo:
             stmt = stmt.where(TrackRow.plate_text == at_rest)
         if since is not None:
             stmt = stmt.where(TrackRow.last_wall_ts >= since)
+        if until is not None:
+            stmt = stmt.where(TrackRow.last_wall_ts <= until)
         stmt = stmt.limit(limit).offset(offset)
         async with self._sessions() as session:
             result = await session.execute(stmt)
@@ -120,12 +123,16 @@ class PlateRepo:
         q: str | None = None,
         stream: str | None = None,
         since: float | None = None,
+        until: float | None = None,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Plate-read search, newest first. In hashed mode ``q`` must be a
         full plate (watchlist-style exact match on the hash); in plain mode
-        it is a normalized substring match."""
-        limit, _ = _clamp(limit)
+        it is a normalized substring match. ``offset`` pages past the first
+        ``offset`` rows of the (stable, id-tiebroken) ordering. ``since``/``until``
+        bound ``wall_ts`` (UNIX seconds)."""
+        limit, offset = _clamp(limit, offset)
         stmt = select(PlateReadRow).order_by(PlateReadRow.wall_ts.desc(), PlateReadRow.id.desc())
         if q:
             if self._hash is not None:
@@ -138,7 +145,9 @@ class PlateRepo:
             stmt = stmt.where(PlateReadRow.stream_id == stream)
         if since is not None:
             stmt = stmt.where(PlateReadRow.wall_ts >= since)
-        stmt = stmt.limit(limit)
+        if until is not None:
+            stmt = stmt.where(PlateReadRow.wall_ts <= until)
+        stmt = stmt.limit(limit).offset(offset)
         async with self._sessions() as session:
             result = await session.execute(stmt)
             return [row.to_dict() for row in result.scalars()]

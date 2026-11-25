@@ -9,6 +9,7 @@ cancelled by the API lifespan on shutdown.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from pathlib import Path
@@ -24,6 +25,9 @@ __all__ = ["purge_once", "retention_task"]
 logger = logging.getLogger(__name__)
 
 _DAY_S = 86_400.0
+# SnapshotSaver writes ``<event_id>.jpg`` only (pipeline/snapshots.py); nothing
+# else under media_dir is ours to delete.
+_SNAPSHOT_SUFFIXES = frozenset({".jpg"})
 
 
 async def purge_once(
@@ -58,16 +62,63 @@ async def purge_once(
     if privacy_cfg.snapshot_retention_days is not None:
         cutoff = now - privacy_cfg.snapshot_retention_days * _DAY_S
         root = Path(media_dir)
-        if root.is_dir():
+        if _is_unsafe_media_root(root):
+            # media_dir pointed at the working dir, "/" or $HOME (e.g. "." or a
+            # dir shared with the DB/config/backups): a sweep there could delete
+            # unrelated files, so refuse it outright and keep the rows-only purge.
+            logger.warning(
+                "retention: refusing snapshot sweep of unsafe media_dir %r", str(media_dir)
+            )
+        elif root.is_dir():
+            # Snapshots live at media_dir/<stream>/<YYYYMMDD>/<event>.jpg; once a
+            # day-folder loses its last file it would linger forever, so track the
+            # dirs we emptied and rmdir them bottom-up below (never media_dir).
+            # Only snapshot files (_SNAPSHOT_SUFFIXES) are ever deleted, so a
+            # media_dir shared with a DB, config or uploads keeps those intact.
+            emptied: set[Path] = set()
             for path in root.rglob("*"):
                 try:
+                    if path.suffix.lower() not in _SNAPSHOT_SUFFIXES:
+                        continue
                     if path.is_file() and path.stat().st_mtime < cutoff:
                         path.unlink(missing_ok=True)
                         counts["snapshots"] += 1
+                        emptied.add(path.parent)
                 except OSError:
                     continue  # file vanished / permission issue: next sweep retries
+            _prune_empty_dirs(emptied, root)
 
     return counts
+
+
+def _is_unsafe_media_root(root: Path) -> bool:
+    """True when ``root`` resolves to the CWD, the filesystem root or $HOME."""
+    try:
+        resolved = root.resolve()
+        unsafe = {Path.cwd().resolve(), Path(resolved.anchor)}
+    except OSError:
+        return True  # cannot prove the path is safe -> do not sweep it
+    # No resolvable home (e.g. a container uid without one): nothing to guard.
+    with contextlib.suppress(OSError, RuntimeError):
+        unsafe.add(Path.home().resolve())
+    return resolved in unsafe
+
+
+def _prune_empty_dirs(dirs: set[Path], root: Path) -> None:
+    """Remove now-empty snapshot dirs bottom-up, stopping at ``root``.
+
+    Deepest paths first so a day-folder is gone before its stream-folder is
+    reconsidered; ``root`` itself is never removed. ``rmdir`` fails on a
+    non-empty dir, which is exactly the guard we want.
+    """
+    for path in sorted(dirs, key=lambda p: len(p.parts), reverse=True):
+        current = path
+        while current != root and root in current.parents:
+            try:
+                current.rmdir()
+            except OSError:
+                break  # not empty (or vanished / permission): leave it in place
+            current = current.parent
 
 
 async def retention_task(

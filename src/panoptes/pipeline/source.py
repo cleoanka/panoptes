@@ -165,7 +165,6 @@ class OpenCvSource(FrameSource):
             count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self.frame_count = count if count > 0 else None
         self._file_frame_index = -1
-        self._backoff_reset()
         return True
 
     def __next__(self) -> FramePacket:
@@ -201,6 +200,10 @@ class OpenCvSource(FrameSource):
                         raise StreamSourceError(f"cannot reopen looped file: {self._source}")
                     continue
                 raise StopIteration
+            # a delivered frame is the only proof the source is healthy: reset
+            # here (not on open) so a source that opens but never streams still
+            # rides the 1s -> 30s backoff instead of a ~1s reconnect loop
+            self._backoff_reset()
             self._emitted_index += 1
             self._file_frame_index += 1
             timestamp = self._timestamp()
@@ -253,12 +256,16 @@ class PyAvSource(FrameSource):
         self._pts0: float | None = None
         self._ts_base = 0.0  # continuity offset across reconnects
         self._last_ts = 0.0
+        # monotonic time the current outage began (None while streaming)
+        self._outage_start: float | None = None
 
     def _open(self) -> bool:
         try:
             container = self._av.open(
                 self._source,
-                options={"rtsp_transport": "tcp", "stimeout": "5000000"},
+                # RTSP socket timeout in µs. FFmpeg 5 renamed "stimeout" to
+                # "timeout" (av>=14 bundles FFmpeg 7, which ignores the old key).
+                options={"rtsp_transport": "tcp", "timeout": "5000000"},
             )
             stream = container.streams.video[0]
             stream.thread_type = "AUTO"
@@ -270,7 +277,6 @@ class PyAvSource(FrameSource):
             self._release()
             return False
         self._pts0 = None
-        self._backoff_reset()
         return True
 
     def _release(self) -> None:
@@ -296,6 +302,18 @@ class PyAvSource(FrameSource):
             except Exception as exc:
                 self._reconnect(f"decode failed: {exc}")
                 continue
+            # proven-healthy frame: reset here (not on open) so a source that
+            # opens but never decodes keeps the 1s -> 30s backoff
+            self._backoff_reset()
+            if self._outage_start is not None:
+                # First frame after a reconnect: PTS restarted, so shift the
+                # base by the real outage length (monotonic clock). Collapsing
+                # it to one frame period hid the gap from lost_ttl, the speed
+                # window and dwell, letting a later vehicle inherit the old
+                # track id, plate votes and zone time.
+                gap = time.monotonic() - self._outage_start
+                self._ts_base = self._last_ts + max(1.0 / (self.fps or 30.0), gap)
+                self._outage_start = None
             timestamp = self._pts_timestamp(frame)
             self._last_ts = timestamp
             image = frame.to_ndarray(format="bgr24")  # type: ignore[attr-defined]
@@ -311,15 +329,17 @@ class PyAvSource(FrameSource):
 
     def _reconnect(self, message: str) -> None:
         self._release()
-        # PTS restarts after reconnect: shift the base so time keeps flowing
-        self._ts_base = self._last_ts + 1.0 / (self.fps or 30.0)
+        # PTS restarts after reconnect; the base is shifted on the next frame,
+        # once the outage length is known.
+        if self._outage_start is None:
+            self._outage_start = time.monotonic()
         self._backoff(message)
 
     def _pts_timestamp(self, frame: object) -> float:
         pts = getattr(frame, "pts", None)
         time_base = getattr(frame, "time_base", None)
         if pts is None or time_base is None:
-            return self._last_ts + 1.0 / (self.fps or 30.0)
+            return max(self._last_ts + 1.0 / (self.fps or 30.0), self._ts_base)
         seconds = float(pts * time_base)
         if self._pts0 is None:
             self._pts0 = seconds

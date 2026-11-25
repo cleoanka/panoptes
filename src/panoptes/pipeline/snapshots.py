@@ -10,6 +10,7 @@ onto the API's ``GET /media/{path}`` route.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import defaultdict, deque
 from datetime import UTC, datetime
@@ -24,6 +25,8 @@ from panoptes.core.types import Track
 from panoptes.pipeline.annotate import annotate
 
 __all__ = ["SnapshotSaver"]
+
+logger = logging.getLogger(__name__)
 
 _JPEG_QUALITY = 90
 _RATE_WINDOW_S = 60.0
@@ -53,13 +56,25 @@ class SnapshotSaver:
         if not self._admit(event.stream_id):
             return None
 
-        day = datetime.fromtimestamp(event.wall_ts, tz=UTC).strftime("%Y%m%d")
-        rel = Path(event.stream_id) / day / f"{event.id}.jpg"
-        full = self._media_dir / rel
-        full.parent.mkdir(parents=True, exist_ok=True)
+        # A snapshot is a best-effort side artifact: a disk-full / permission /
+        # read-only-FS write error, or a malformed wall_ts, must degrade to
+        # "no snapshot for this event" — never unwind through process() and tear
+        # down the whole live stream / video job. Isolate every failure-prone
+        # step (timestamp formatting, mkdir, imwrite) here.
+        try:
+            day = datetime.fromtimestamp(event.wall_ts, tz=UTC).strftime("%Y%m%d")
+            rel = Path(event.stream_id) / day / f"{event.id}.jpg"
+            full = self._media_dir / rel
+            full.parent.mkdir(parents=True, exist_ok=True)
 
-        image = annotate(frame, tracks, None, None) if self._config.annotate else frame
-        ok = cv2.imwrite(str(full), image, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+            image = annotate(frame, tracks, None, None) if self._config.annotate else frame
+            ok = cv2.imwrite(str(full), image, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_QUALITY])
+        except (OSError, ValueError, OverflowError, cv2.error) as exc:
+            logger.warning(
+                "snapshot write failed for event %s on stream %s: %s; continuing without it",
+                event.id, event.stream_id, exc,
+            )
+            return None
         if not ok:
             return None
         return rel.as_posix()

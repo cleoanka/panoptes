@@ -15,6 +15,12 @@ any existing tracker codebase:
   frame could never accumulate the ``min_hits`` consecutive hits needed
   to confirm.
 
+The lost buffer (LOST state, kept for ``lost_ttl`` seconds) holds only
+*confirmed* tracks. An unconfirmed track that misses a frame is dropped
+immediately — canonical ByteTrack treats tentative evidence as
+disposable, so a one-frame blip can't linger the full TTL and hijack a
+later detection that really belongs to a new object.
+
 Matching simplification: instead of the Hungarian algorithm we use a
 greedy max-IoU matcher — all admissible pairs sorted by IoU descending,
 accepted while both sides are free. Globally suboptimal in rare
@@ -73,17 +79,19 @@ def _greedy_match(
     track_boxes = np.array([e.predicted.to_xyxy() for e in entries], dtype=np.float64)
     det_boxes = np.array([d.bbox.to_xyxy() for d in detections], dtype=np.float64)
     iou = bbox_ious(track_boxes, det_boxes)
-    candidates = [
-        (float(iou[i, j]), i, j)
-        for i in range(len(entries))
-        for j in range(len(detections))
-        if iou[i, j] >= min_iou
-    ]
-    candidates.sort(key=lambda c: (-c[0], c[1], c[2]))
+    # Threshold in numpy, then order the survivors by descending IoU. A
+    # *stable* argsort keeps np.nonzero's row-major (i, j) order intact,
+    # reproducing the old ``(-iou, i, j)`` tie-break bit-for-bit while
+    # skipping the sub-threshold majority and per-cell float() calls. The
+    # float64 cast matches the old float() promotion of the float32 matrix.
+    ii, jj = np.nonzero(iou >= min_iou)
+    order = np.argsort(-iou[ii, jj].astype(np.float64), kind="stable")
     taken_tracks: set[int] = set()
     taken_dets: set[int] = set()
     pairs: list[tuple[_Entry, Detection]] = []
-    for _iou, i, j in candidates:
+    for k in order:
+        i = int(ii[k])
+        j = int(jj[k])
         if i in taken_tracks or j in taken_dets:
             continue
         taken_tracks.add(i)
@@ -146,6 +154,14 @@ class ByteTrackTracker(Tracker):
         matched_ids = {entry.track.track_id for entry, _ in matches}
         for entry in entries:
             if entry.track.track_id in matched_ids:
+                continue
+            # ByteTrack's lost buffer holds only *confirmed* tracks. An
+            # unconfirmed (never-ACTIVE) track is tentative evidence: drop it
+            # the frame it misses so a one-frame blip can't linger a full
+            # lost_ttl and hijack a later detection that belongs to a new
+            # object. No _finished entry — it was never a real object.
+            if not entry.confirmed:
+                del self._live[entry.track.track_id]
                 continue
             if entry.track.state is not TrackState.LOST:
                 entry.track.state = TrackState.LOST

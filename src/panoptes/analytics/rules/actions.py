@@ -14,18 +14,54 @@ import queue
 import threading
 from collections.abc import Sequence
 from typing import ClassVar
+from urllib.parse import urlsplit
 
 import httpx
 import structlog
 
 from panoptes.core.config import LogAction, RuleAction, SnapshotAction, WebhookAction
 from panoptes.core.events import Event
+from panoptes.core.jsonsafe import finite
 
 __all__ = ["ActionDispatcher"]
 
 logger = structlog.get_logger("panoptes.analytics.actions")
 
 _JOIN_TIMEOUT_S = 10.0
+
+
+def _loggable_url(url: str) -> str:
+    """``scheme://host[:port]/***`` for logs.
+
+    A webhook URL is itself a bearer secret (Slack/Teams/ops tokens live in
+    the path and query; userinfo may hold credentials), which is why
+    ``/system/config`` masks it whole. Keep only what identifies the target.
+    """
+    try:
+        parts = urlsplit(url)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return "***"
+    if not parts.scheme or not host:
+        return "***"
+    if ":" in host:  # IPv6 literal
+        host = f"[{host}]"
+    return f"{parts.scheme}://{host}{f':{port}' if port else ''}/***"
+
+
+def _loggable_error(exc: Exception, url: str, masked: str) -> str:
+    """``Type: message`` with the URL and its secret-bearing parts masked
+    (httpx error messages can embed the request URL)."""
+    text = str(exc).replace(url, masked)
+    try:
+        parts = urlsplit(url)
+        secrets = [parts.query, parts.path, parts.netloc.rpartition("@")[0]]
+    except ValueError:
+        secrets = []
+    for secret in secrets:
+        if len(secret) > 1:
+            text = text.replace(secret, "***")
+    return f"{type(exc).__name__}: {text}"
 
 
 class ActionDispatcher:
@@ -46,6 +82,21 @@ class ActionDispatcher:
             if cls._shared is None or cls._shared._closed:
                 cls._shared = cls()
             return cls._shared
+
+    @classmethod
+    def close_shared(cls) -> None:
+        """Drain and stop the process-wide singleton, if one was started.
+
+        The shutdown hook (API lifespan / ``PipelineManager.stop``) calls
+        this so queued webhook/log actions are flushed and the worker
+        thread joined instead of dying with the interpreter. Idempotent:
+        a fresh singleton is lazily recreated by :meth:`shared` on any
+        later use.
+        """
+        with cls._shared_guard:
+            dispatcher = cls._shared
+        if dispatcher is not None:
+            dispatcher.close()
 
     def __init__(self, max_queue: int = 1024) -> None:
         self._queue: queue.Queue[tuple[Event, WebhookAction | LogAction] | None] = queue.Queue(
@@ -120,7 +171,10 @@ class ActionDispatcher:
         self._post(event, action)
 
     def _post(self, event: Event, action: WebhookAction) -> None:
-        payload = event.to_dict()
+        # httpx encodes json= with allow_nan=False: a NaN in event.data would
+        # raise on every attempt and silently drop the delivery.
+        payload = finite(event.to_dict())
+        log_url = _loggable_url(action.url)
         for attempt in (1, 2):  # exactly 1 retry
             try:
                 response = httpx.post(
@@ -133,12 +187,17 @@ class ActionDispatcher:
                     return
                 logger.warning(
                     "webhook returned error status",
-                    url=action.url,
+                    url=log_url,
                     status=response.status_code,
                     attempt=attempt,
                 )
             except Exception as exc:
-                logger.warning("webhook failed", url=action.url, error=str(exc), attempt=attempt)
+                logger.warning(
+                    "webhook failed",
+                    url=log_url,
+                    error=_loggable_error(exc, action.url, log_url),
+                    attempt=attempt,
+                )
 
     # -- lifecycle --------------------------------------------------------
     def close(self) -> None:

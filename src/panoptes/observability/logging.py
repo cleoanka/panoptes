@@ -36,6 +36,14 @@ class _SecretScrubFilter(logging.Filter):
     """Redacts ``api_key=`` query values from every record on the handler."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, dict):
+            # structlog's event dict: ProcessorFormatter needs it to stay a
+            # dict (it calls .copy()), so redact the string values in place.
+            record.msg = {
+                k: _API_KEY_RX.sub(r"\1***", v) if isinstance(v, str) and "api_key=" in v else v
+                for k, v in record.msg.items()
+            }
+            return True
         try:
             msg = record.getMessage()
         except Exception:  # never let logging break the app

@@ -10,7 +10,7 @@ VERSION   := 0.1.0
 # anchored at the repo root regardless of where the compose file lives.
 COMPOSE   := docker compose --project-directory . -f deploy/docker-compose.yml
 
-.PHONY: setup test lint serve demo docker-cpu docker-gpu compose-up compose-gpu license-gate clean
+.PHONY: setup test lint serve demo docker-cpu docker-gpu compose-up compose-gpu license-gate license-gate-release clean
 
 ## setup: create the venv and install Panoptes editable with dev tooling.
 setup:
@@ -57,7 +57,16 @@ compose-gpu:
 	$(COMPOSE) -f deploy/docker-compose.gpu.yml up -d --build
 
 ## license-gate: fail on AGPL/GPL-3.0/SSPL deps, banned packages, x264/x265 binaries.
+## Exempts opencv-python-headless from the *binary* scan only (a base dep whose
+## pip wheel bundles GPL x264/x265 FFmpeg; the release image ships LGPL/system
+## OpenCV instead — see docs/LICENSING.md). Matches the CI invocation so the
+## documented contributor gate is green on a clean `make setup` checkout.
 license-gate:
+	$(PY) deploy/scripts/license_gate.py --exempt-package opencv-python-headless
+
+## license-gate-release: no exemptions — the in-image certification form, run
+## inside the redistributed release image where OpenCV carries no GPL codecs.
+license-gate-release:
 	$(PY) deploy/scripts/license_gate.py
 
 ## clean: remove build artifacts and tool caches (keeps .venv and data).

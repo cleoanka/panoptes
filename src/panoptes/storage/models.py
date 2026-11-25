@@ -106,7 +106,7 @@ class TrackRow(Base):
             "plate": self.plate_text,
             "plate_confidence": self.plate_confidence,
             "color": self.color,
-            "attributes": self.attributes,
+            "attributes": self.attributes or {},
             "n_points": self.n_points,
         }
 
